@@ -1,0 +1,48 @@
+# Version control / CI
+.git
+.github
+.gitignore
+
+# Local Python envs and caches
+.venv
+venv
+env
+ENV
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Build outputs (Nuitka etc.)
+build
+dist
+*.spec
+*.manifest
+
+# Tests / dev-only files
+tests
+requirements-dev.txt
+pytest.ini
+
+# Local secrets / configs (must be mounted at runtime)
+.env
+.env.*
+commands.yaml
+runs
+
+# Editor / OS junk
+.idea
+.vscode
+.DS_Store
+
+# Docs / project meta not needed in image
+README.md
+LICENSE
+build.sh
+.qoder
+.dockerignore
+Dockerfile
