@@ -1,0 +1,39 @@
+# Server runtime parameters (optional; can be overridden by environment variables).
+server:
+  host: 0.0.0.0
+  port: 8000
+  # Public base URL clients use to reach this server.
+  # Required (here or via RCM_PUBLIC_BASE_URL).
+  public_base_url: https://rcm.example.com
+
+# Optional auth block. RCM_API_KEY env var takes precedence.
+# auth:
+#   api_key: change-me
+
+# Optional defaults applied to every command.
+defaults:
+  timeout: 30          # seconds
+  cwd: /var/log        # working directory
+
+commands:
+  - name: disk_usage
+    description: Show disk usage of mounted filesystems.
+    command: ["df", "-h"]
+
+  - name: tail_log
+    description: Tail the last N lines of a log file under /var/log.
+    command: ["tail", "-n", "{lines}", "/var/log/{file}"]
+    params:
+      lines:
+        type: integer
+        description: Number of lines to read.
+        default: 100
+      file:
+        type: string
+        description: Filename under /var/log (no slashes allowed).
+        pattern: '^[A-Za-z0-9._-]+$'
+
+  - name: uptime_info
+    description: Print system uptime and load average.
+    command: ["uptime"]
+    timeout: 5
