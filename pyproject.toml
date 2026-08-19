@@ -11,6 +11,13 @@ dependencies = [
     "wsgidav>=4.3",
 ]
 
+[project.scripts]
+rcm = "rcm.server:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
 [dependency-groups]
 dev = [
     "httpx>=0.27",
@@ -20,10 +27,10 @@ dev = [
     "pytest-asyncio>=0.23",
 ]
 
-[tool.uv]
-package = false
-
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple"
 default = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["rcm"]

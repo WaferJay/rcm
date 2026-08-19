@@ -17,7 +17,7 @@ WORKDIR /build
 # Only copy dependency metadata first to maximize layer cache.
 COPY pyproject.toml uv.lock ./
 
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --no-install-project
 
 # ---- runtime ----------------------------------------------------------------
 FROM python:3.12-slim AS runtime

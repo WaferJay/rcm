@@ -32,6 +32,25 @@ uv run python -m rcm
 # Output download: $RCM_PUBLIC_BASE_URL/runs/<run_id>/{stdout,stderr,meta}
 ```
 
+After installing or publishing the package, the CLI can also be invoked from
+any directory with uvx:
+
+```bash
+RCM_CONFIG=/etc/rcm/commands.yaml \
+RCM_RUNS_DIR=/var/lib/rcm/runs \
+uvx rcm
+```
+
+To run directly from a local checkout or Git repository:
+
+```bash
+uvx --from /opt/rcm rcm
+uvx --from git+https://github.com/example/rcm rcm
+```
+
+The `rcm` command is declared in `pyproject.toml` as the entry point for
+`rcm.server:main`.
+
 Run the test suite with:
 
 ```bash
