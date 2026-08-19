@@ -1,20 +1,23 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- builder: install deps into an isolated venv ----------------------------
+FROM ghcr.io/astral-sh/uv:0.11.0 AS uv
+
 FROM python:3.12-slim AS builder
 
-ENV PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+COPY --from=uv /uv /uvx /bin/
+
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
     PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /build
 
-# Only copy requirements first to maximize layer cache.
-COPY requirements.txt ./
+# Only copy dependency metadata first to maximize layer cache.
+COPY pyproject.toml uv.lock ./
 
-RUN python -m venv /opt/venv \
-    && /opt/venv/bin/pip install --upgrade pip \
-    && /opt/venv/bin/pip install -r requirements.txt
+RUN uv sync --frozen --no-dev
 
 # ---- runtime ----------------------------------------------------------------
 FROM python:3.12-slim AS runtime

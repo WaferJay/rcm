@@ -10,14 +10,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-if [[ -d .venv ]]; then
-  # shellcheck disable=SC1091
-  source .venv/bin/activate
+if ! command -v uv >/dev/null 2>&1; then
+  echo "error: uv is required; install it from https://docs.astral.sh/uv/" >&2
+  exit 1
 fi
 
-if ! python -c "import nuitka" >/dev/null 2>&1; then
-  echo ">>> Nuitka not found in the active environment; installing..."
-  python -m pip install --quiet 'nuitka>=2.4'
+uv sync
+
+if ! uv run --no-sync python -c "import nuitka" >/dev/null 2>&1; then
+  echo "error: Nuitka is missing from the uv development environment" >&2
+  exit 1
 fi
 
 MODE="${1:-standalone}"
@@ -77,21 +79,21 @@ for pkg in \
     email_validator dns annotated_types \
     importlib_metadata \
     ; do
-  if python -c "import $pkg" >/dev/null 2>&1; then
+  if uv run --no-sync python -c "import $pkg" >/dev/null 2>&1; then
     COMMON+=("--include-package=$pkg")
   fi
 done
 
 # Bundle package data (templates, JSON schemas, etc.) for libraries we ship.
 for pkg in fastmcp mcp starlette wsgidav a2wsgi pydantic uvicorn jsonschema_specifications certifi; do
-  if python -c "import $pkg" >/dev/null 2>&1; then
+  if uv run --no-sync python -c "import $pkg" >/dev/null 2>&1; then
     COMMON+=("--include-package-data=$pkg")
   fi
 done
 
 # Optional uvicorn extras / yaml C accelerator. Include only what is installed.
 for opt_mod in h11 httptools websockets wsproto uvloop _yaml exceptiongroup; do
-  if python -c "import $opt_mod" >/dev/null 2>&1; then
+  if uv run --no-sync python -c "import $opt_mod" >/dev/null 2>&1; then
     COMMON+=("--include-module=$opt_mod")
   fi
 done
@@ -106,7 +108,7 @@ for dist in fastmcp fastmcp-slim mcp uvicorn starlette wsgidav a2wsgi pydantic p
             pydantic-settings opentelemetry-api anyio httpx httpcore httpx-sse \
             sse-starlette PyYAML jsonschema rich click cyclopts authlib certifi \
             python-multipart; do
-  if python -c "from importlib.metadata import distribution; distribution('$dist')" >/dev/null 2>&1; then
+  if uv run --no-sync python -c "from importlib.metadata import distribution; distribution('$dist')" >/dev/null 2>&1; then
     COMMON+=("--include-distribution-metadata=$dist")
   fi
 done
@@ -117,7 +119,7 @@ if [[ "$MODE" == "onefile" ]]; then
 fi
 
 set -x
-python -m nuitka "${COMMON[@]}" "$@" run_rcm.py
+uv run --no-sync python -m nuitka "${COMMON[@]}" "$@" run_rcm.py
 set +x
 
 if [[ "$MODE" == "standalone" ]]; then

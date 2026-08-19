@@ -17,20 +17,25 @@ named MCP tools, served over **HTTP Streaming** (Streamable HTTP transport).
 ## Quickstart
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
+# Install uv: https://docs.astral.sh/uv/getting-started/installation/
+uv sync
 
 cp commands.example.yaml commands.yaml
 # Edit commands.yaml and set server.public_base_url, or:
 export RCM_PUBLIC_BASE_URL=https://rcm.example.com
 
-export RCM_API_KEY=$(python -c 'import secrets;print(secrets.token_urlsafe(32))')
+export RCM_API_KEY=$(uv run python -c 'import secrets;print(secrets.token_urlsafe(32))')
 echo "API key: $RCM_API_KEY"
 
-python -m rcm
+uv run python -m rcm
 # MCP endpoint:    $RCM_PUBLIC_BASE_URL/mcp/
 # Output download: $RCM_PUBLIC_BASE_URL/runs/<run_id>/{stdout,stderr,meta}
+```
+
+Run the test suite with:
+
+```bash
+uv run pytest
 ```
 
 ## Configuring commands
@@ -144,8 +149,8 @@ You can compile rcm into a self-contained binary with Nuitka. The result is a
 without needing Python installed.
 
 ```bash
-# Install build dependency (Nuitka + importlib_metadata shim)
-pip install 'nuitka>=2.4' importlib_metadata
+# Install the locked runtime and build dependencies
+uv sync
 
 # Build (takes ~5-10 minutes on first run; ccache speeds up rebuilds)
 ./build.sh                  # standalone (default)
@@ -157,11 +162,11 @@ RCM_API_KEY=... RCM_PUBLIC_BASE_URL=https://rcm.example.com \
   ./build/run_rcm.dist/rcm
 ```
 
-`build.sh` automatically probes which packages are installed and includes
-them. Key caveats:
+`build.sh` uses the uv-managed environment and automatically probes which
+packages are installed and includes them. Key caveats:
 
-- `importlib_metadata` (third-party) must be installed because Nuitka's
-  anti-bloat rewrites `opentelemetry` imports to use it.
+- `importlib_metadata` is included in the uv development dependency group
+  because Nuitka's anti-bloat rewrites `opentelemetry` imports to use it.
 - Python 3.14 support in Nuitka is experimental; 3.12-3.13 are safer.
 - For onefile mode, add `--onefile-tempdir-spec={CACHE_DIR}/rcm` to avoid
   re-extracting on every launch (already set in `build.sh`).

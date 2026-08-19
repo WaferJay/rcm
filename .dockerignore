@@ -25,7 +25,6 @@ dist
 
 # Tests / dev-only files
 tests
-requirements-dev.txt
 pytest.ini
 
 # Local secrets / configs (must be mounted at runtime)
