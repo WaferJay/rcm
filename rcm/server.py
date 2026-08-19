@@ -10,13 +10,16 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+from starlette.applications import Starlette
 from starlette.requests import Request
+from starlette.routing import Mount
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 from .auth import ApiKeyAuth
 from .config import CommandSpec, Config, ParamSpec, load_config
 from .runner import run_command
 from .store import RUN_ID_RE, Store
+from .webdav import WebDAVError, build_webdav_app
 
 PY_TYPES: dict[str, type] = {
     "string": str,
@@ -169,6 +172,23 @@ def build_server(cfg: Config, store: Store, api_key: str) -> FastMCP:
     return mcp
 
 
+def build_http_app(mcp: FastMCP, cfg: Config, api_key: str) -> Starlette:
+    """Build the HTTP application, optionally mounting the WebDAV service."""
+    if cfg.webdav is None:
+        return mcp.http_app()
+
+    webdav_app = build_webdav_app(cfg.webdav, api_key)
+    mcp_app = mcp.http_app()
+    webdav_mount = cfg.webdav.path.rstrip("/")
+    return Starlette(
+        routes=[
+            Mount(webdav_mount, app=webdav_app),
+            Mount("/", app=mcp_app),
+        ],
+        lifespan=mcp_app.lifespan,
+    )
+
+
 def main() -> None:
     cfg_path = os.environ.get("RCM_CONFIG", "commands.yaml")
     try:
@@ -201,14 +221,29 @@ def main() -> None:
     if retention > 0:
         store.prune(retention)
 
-    mcp = build_server(cfg, store, api_key)
-
     host = os.environ.get("RCM_HOST") or cfg.server.host or "0.0.0.0"
     port = int(os.environ.get("RCM_PORT") or cfg.server.port or 8000)
+
+    mcp = build_server(cfg, store, api_key)
 
     print(
         f"rcm: serving {len(cfg.commands)} command tool(s) "
         f"on http://{host}:{port}/mcp/  (public base: {public_base_url})",
         file=sys.stderr,
     )
-    mcp.run(transport="http", host=host, port=port)
+    if cfg.webdav is None:
+        mcp.run(transport="http", host=host, port=port)
+        return
+
+    try:
+        app = build_http_app(mcp, cfg, api_key)
+    except WebDAVError as e:
+        sys.exit(f"rcm: failed to configure WebDAV: {e}")
+
+    print(
+        f"rcm: WebDAV available at http://{host}:{port}{cfg.webdav.path}",
+        file=sys.stderr,
+    )
+    import uvicorn
+
+    uvicorn.run(app, host=host, port=port)

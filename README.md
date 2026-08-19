@@ -12,6 +12,7 @@ named MCP tools, served over **HTTP Streaming** (Streamable HTTP transport).
   **public**; access is gated by the unguessable 256-bit `run_id`
   (capability URLs).
 - The MCP endpoint itself requires `Authorization: Bearer <RCM_API_KEY>`.
+- An optional WebDAV share can be mounted on the same HTTP server.
 
 ## Quickstart
 
@@ -40,6 +41,13 @@ server:
   port: 8000
   public_base_url: https://rcm.example.com
 
+webdav:
+  root: /srv/rcm-files
+  path: /webdav/
+  read_only: true
+  auth:
+    type: bearer
+
 defaults:
   timeout: 30
   cwd: /var/log
@@ -63,6 +71,25 @@ Rules:
 - `params[*].type` is one of `string`, `integer`, `number`, `boolean`.
 - Optional per-param: `description`, `default`, `pattern` (regex), `enum`.
 - `name` must match `^[a-zA-Z_][a-zA-Z0-9_]*$` and be globally unique.
+
+## WebDAV
+
+WebDAV is enabled when the `webdav` section is present. The root must already
+exist and be a directory. The default path is `/webdav/`, the default mode is
+read-only, and the default authentication type is `bearer`, which reuses
+`RCM_API_KEY`.
+
+Authentication types:
+
+- `bearer`: use `Authorization: Bearer <RCM_API_KEY>`.
+- `basic`: provide `username` and `password` under `webdav.auth`. The password
+  can be overridden with `RCM_WEBDAV_PASSWORD`.
+- `none`: allow anonymous access.
+
+The WebDAV path cannot overlap `/mcp`, `/runs`, or `/healthz`. Enable
+`read_only: false` only for a directory that is safe for remote modification.
+Use TLS directly or place a TLS-terminating reverse proxy in front of the
+service, especially when using Basic authentication.
 
 ## Calling from an agent
 
@@ -108,6 +135,7 @@ curl 'https://rcm.example.com/runs/k7Q.../stdout?tail=4096'
 | `RCM_HOST` / `RCM_PORT` | Bind address/port (defaults: `0.0.0.0` / `8000`). |
 | `RCM_RUNS_DIR` | Where stdout/stderr/meta are written (default: `./runs`). |
 | `RCM_RUNS_RETENTION` | Keep at most N runs on disk (pruned at startup). `0` = keep all. |
+| `RCM_WEBDAV_PASSWORD` | Overrides the configured WebDAV Basic-auth password. |
 
 ## Building a standalone binary (Nuitka)
 

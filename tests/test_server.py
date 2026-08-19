@@ -11,7 +11,16 @@ import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
-from rcm.config import CommandSpec, Config, DefaultsSpec, ParamSpec, ServerSpec, AuthSpec
+from rcm.config import (
+    AuthSpec,
+    CommandSpec,
+    Config,
+    DefaultsSpec,
+    ParamSpec,
+    ServerSpec,
+    WebDAVAuthSpec,
+    WebDAVSpec,
+)
 from rcm.server import _build_tool_fn, build_server
 from rcm.store import Store
 
@@ -216,3 +225,111 @@ async def test_healthz(running_server) -> None:
         resp = await h.get(f"{base}/healthz")
         assert resp.status_code == 200
         assert resp.text == "ok"
+
+
+def test_webdav_root_validation(tmp_path: Path) -> None:
+    from rcm.webdav import WebDAVError, resolve_webdav_root
+
+    spec = WebDAVSpec(root=str(tmp_path / "missing"))
+    with pytest.raises(WebDAVError, match="does not exist"):
+        resolve_webdav_root(spec)
+
+
+@pytest.mark.asyncio
+async def test_webdav_readonly_mount(tmp_path: Path) -> None:
+    import httpx
+
+    from rcm.server import build_http_app
+
+    (tmp_path / "hello.txt").write_text("hello", encoding="utf-8")
+    cfg = Config(
+        server=ServerSpec(public_base_url="http://testserver"),
+        auth=AuthSpec(api_key=None),
+        defaults=DefaultsSpec(),
+        commands=[],
+        webdav=WebDAVSpec(
+            root=str(tmp_path),
+            auth=WebDAVAuthSpec(type="none"),
+        ),
+    )
+    # The HTTP app only needs a FastMCP instance for this routing test.
+    mcp = build_server(cfg, Store(tmp_path / "runs", "http://testserver"), "key")
+    app = build_http_app(mcp, cfg, "key")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as h:
+        resp = await h.get("/healthz")
+        assert resp.status_code == 200
+        assert resp.text == "ok"
+
+        resp = await h.get("/webdav/hello.txt")
+        assert resp.status_code == 200
+        assert resp.text == "hello"
+
+        resp = await h.request("PROPFIND", "/webdav/", headers={"Depth": "1"})
+        assert resp.status_code == 207
+
+        resp = await h.put("/webdav/new.txt", content=b"new")
+        assert resp.status_code >= 400
+
+
+@pytest.mark.asyncio
+async def test_webdav_bearer_auth(tmp_path: Path) -> None:
+    import httpx
+
+    from rcm.server import build_http_app
+
+    (tmp_path / "hello.txt").write_text("hello", encoding="utf-8")
+    cfg = Config(
+        server=ServerSpec(public_base_url="http://testserver"),
+        auth=AuthSpec(api_key=None),
+        defaults=DefaultsSpec(),
+        commands=[],
+        webdav=WebDAVSpec(root=str(tmp_path)),
+    )
+    mcp = build_server(cfg, Store(tmp_path / "runs", "http://testserver"), "key")
+    app = build_http_app(mcp, cfg, "key")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as h:
+        resp = await h.get("/webdav/hello.txt")
+        assert resp.status_code == 401
+        assert resp.headers["www-authenticate"] == "Bearer"
+
+        resp = await h.get(
+            "/webdav/hello.txt", headers={"Authorization": "Bearer key"}
+        )
+        assert resp.status_code == 200
+        assert resp.text == "hello"
+
+
+@pytest.mark.asyncio
+async def test_webdav_basic_auth(tmp_path: Path) -> None:
+    import httpx
+
+    from rcm.server import build_http_app
+
+    (tmp_path / "hello.txt").write_text("hello", encoding="utf-8")
+    cfg = Config(
+        server=ServerSpec(public_base_url="http://testserver"),
+        auth=AuthSpec(api_key=None),
+        defaults=DefaultsSpec(),
+        commands=[],
+        webdav=WebDAVSpec(
+            root=str(tmp_path),
+            auth=WebDAVAuthSpec(type="basic", username="alice", password="secret"),
+        ),
+    )
+    mcp = build_server(cfg, Store(tmp_path / "runs", "http://testserver"), "key")
+    app = build_http_app(mcp, cfg, "key")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as h:
+        resp = await h.get("/webdav/hello.txt")
+        assert resp.status_code == 401
+
+        resp = await h.get(
+            "/webdav/hello.txt", auth=httpx.BasicAuth("alice", "secret")
+        )
+        assert resp.status_code == 200
+        assert resp.text == "hello"

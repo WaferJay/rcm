@@ -12,6 +12,8 @@ import yaml
 
 NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 PARAM_TYPES = {"string", "integer", "number", "boolean"}
+WEBDAV_AUTH_TYPES = {"basic", "bearer", "none"}
+WEBDAV_RESERVED_PATHS = ("/mcp", "/runs", "/healthz")
 
 
 class ConfigError(ValueError):
@@ -58,11 +60,27 @@ class DefaultsSpec:
 
 
 @dataclass
+class WebDAVAuthSpec:
+    type: str = "bearer"
+    username: str | None = None
+    password: str | None = None
+
+
+@dataclass
+class WebDAVSpec:
+    root: str
+    path: str = "/webdav/"
+    read_only: bool = True
+    auth: WebDAVAuthSpec = field(default_factory=WebDAVAuthSpec)
+
+
+@dataclass
 class Config:
     server: ServerSpec
     auth: AuthSpec
     defaults: DefaultsSpec
     commands: list[CommandSpec]
+    webdav: WebDAVSpec | None = None
 
 
 def _placeholders(s: str) -> list[str]:
@@ -174,6 +192,71 @@ def _parse_command(raw: dict[str, Any]) -> CommandSpec:
     )
 
 
+def _normalize_webdav_path(path: Any) -> str:
+    if not isinstance(path, str) or not path.strip():
+        raise ConfigError("webdav.path must be a non-empty string")
+
+    normalized = "/" + path.strip().strip("/")
+    if normalized == "/":
+        raise ConfigError("webdav.path must not be `/`")
+    if any(
+        normalized == reserved or normalized.startswith(reserved + "/")
+        for reserved in WEBDAV_RESERVED_PATHS
+    ):
+        raise ConfigError(
+            f"webdav.path {path!r} conflicts with a reserved path; "
+            f"reserved paths are {list(WEBDAV_RESERVED_PATHS)!r}"
+        )
+    return normalized + "/"
+
+
+def _parse_webdav(raw: Any) -> WebDAVSpec:
+    if not isinstance(raw, dict):
+        raise ConfigError("`webdav` must be a mapping")
+
+    root = raw.get("root")
+    if not isinstance(root, str) or not root.strip():
+        raise ConfigError("webdav.root must be a non-empty string")
+
+    read_only = raw.get("read_only", True)
+    if not isinstance(read_only, bool):
+        raise ConfigError("webdav.read_only must be a boolean")
+
+    auth_raw = raw.get("auth")
+    if auth_raw is None:
+        auth_raw = {}
+    if not isinstance(auth_raw, dict):
+        raise ConfigError("webdav.auth must be a mapping")
+    auth_type = auth_raw.get("type", "bearer")
+    if not isinstance(auth_type, str) or auth_type not in WEBDAV_AUTH_TYPES:
+        raise ConfigError(
+            "webdav.auth.type must be one of "
+            f"{sorted(WEBDAV_AUTH_TYPES)}, got {auth_type!r}"
+        )
+
+    username = auth_raw.get("username")
+    password = auth_raw.get("password")
+    if username is not None and (not isinstance(username, str) or not username):
+        raise ConfigError("webdav.auth.username must be a non-empty string")
+    if password is not None and (not isinstance(password, str) or not password):
+        raise ConfigError("webdav.auth.password must be a non-empty string")
+    if auth_type == "basic" and (username is None or password is None):
+        raise ConfigError(
+            "webdav.auth.username and webdav.auth.password are required for basic auth"
+        )
+
+    return WebDAVSpec(
+        root=root,
+        path=_normalize_webdav_path(raw.get("path", "/webdav/")),
+        read_only=read_only,
+        auth=WebDAVAuthSpec(
+            type=auth_type,
+            username=username,
+            password=password,
+        ),
+    )
+
+
 def load_config(path: str | Path) -> Config:
     path = Path(path)
     try:
@@ -220,4 +303,12 @@ def load_config(path: str | Path) -> Config:
             raise ConfigError(f"duplicate command name: {cmd.name!r}")
         seen.add(cmd.name)
 
-    return Config(server=server, auth=auth, defaults=defaults, commands=commands)
+    webdav = _parse_webdav(raw["webdav"]) if "webdav" in raw else None
+
+    return Config(
+        server=server,
+        auth=auth,
+        defaults=defaults,
+        commands=commands,
+        webdav=webdav,
+    )

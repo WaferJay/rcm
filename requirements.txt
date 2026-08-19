@@ -1,2 +1,4 @@
 fastmcp>=2.0
+wsgidav>=4.3
+a2wsgi>=1.10
 pyyaml>=6

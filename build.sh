@@ -63,7 +63,7 @@ COMMON=(
 # Nuitka's static analysis cannot see. Probe importability so the build
 # does not break when an optional dependency is not installed.
 for pkg in \
-    fastmcp fastmcp_slim mcp uvicorn starlette \
+    fastmcp fastmcp_slim mcp uvicorn starlette wsgidav a2wsgi \
     pydantic pydantic_core pydantic_settings \
     anyio sniffio httpx httpcore httpx_sse h11 sse_starlette \
     yaml exceptiongroup typing_extensions typing_inspection \
@@ -83,7 +83,7 @@ for pkg in \
 done
 
 # Bundle package data (templates, JSON schemas, etc.) for libraries we ship.
-for pkg in fastmcp mcp starlette pydantic uvicorn jsonschema_specifications certifi; do
+for pkg in fastmcp mcp starlette wsgidav a2wsgi pydantic uvicorn jsonschema_specifications certifi; do
   if python -c "import $pkg" >/dev/null 2>&1; then
     COMMON+=("--include-package-data=$pkg")
   fi
@@ -102,7 +102,7 @@ done
 
 # Some packages check importlib.metadata for their distribution info / entry
 # points at runtime; keep that metadata in the bundle.
-for dist in fastmcp fastmcp-slim mcp uvicorn starlette pydantic pydantic-core \
+for dist in fastmcp fastmcp-slim mcp uvicorn starlette wsgidav a2wsgi pydantic pydantic-core \
             pydantic-settings opentelemetry-api anyio httpx httpcore httpx-sse \
             sse-starlette PyYAML jsonschema rich click cyclopts authlib certifi \
             python-multipart; do
