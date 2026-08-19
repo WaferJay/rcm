@@ -66,6 +66,10 @@ class BearerAuthMiddleware:
 def _wsgidav_config(spec: WebDAVSpec) -> dict[str, Any]:
     auth = spec.auth
     config: dict[str, Any] = {
+        # WsgiDAV uses this value when constructing resource hrefs. The ASGI
+        # mount already supplies the same prefix as WSGI SCRIPT_NAME, but the
+        # provider's mount_path is configured independently by WsgiDAV.
+        "mount_path": spec.path.rstrip("/"),
         "provider_mapping": {
             "/": {"root": str(resolve_webdav_root(spec)), "readonly": spec.read_only}
         },

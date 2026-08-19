@@ -238,6 +238,7 @@ def test_webdav_root_validation(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_webdav_readonly_mount(tmp_path: Path) -> None:
     import httpx
+    import xml.etree.ElementTree as ET
 
     from rcm.server import build_http_app
 
@@ -268,9 +269,49 @@ async def test_webdav_readonly_mount(tmp_path: Path) -> None:
 
         resp = await h.request("PROPFIND", "/webdav/", headers={"Depth": "1"})
         assert resp.status_code == 207
+        hrefs = [
+            element.text
+            for element in ET.fromstring(resp.content).iter("{DAV:}href")
+        ]
+        assert "/webdav/" in hrefs
+        assert "/webdav/hello.txt" in hrefs
 
         resp = await h.put("/webdav/new.txt", content=b"new")
         assert resp.status_code >= 400
+
+
+@pytest.mark.asyncio
+async def test_webdav_hrefs_include_custom_mount_path(tmp_path: Path) -> None:
+    import httpx
+    import xml.etree.ElementTree as ET
+
+    from rcm.server import build_http_app
+
+    (tmp_path / "test").mkdir()
+    (tmp_path / "test" / "a.txt").write_text("hello", encoding="utf-8")
+    cfg = Config(
+        server=ServerSpec(public_base_url="http://testserver"),
+        auth=AuthSpec(api_key=None),
+        defaults=DefaultsSpec(),
+        commands=[],
+        webdav=WebDAVSpec(
+            root=str(tmp_path),
+            path="/files/",
+            auth=WebDAVAuthSpec(type="none"),
+        ),
+    )
+    mcp = build_server(cfg, Store(tmp_path / "runs", "http://testserver"), "key")
+    app = build_http_app(mcp, cfg, "key")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as h:
+        resp = await h.request("PROPFIND", "/files/test/a.txt")
+
+    assert resp.status_code == 207
+    hrefs = [
+        element.text for element in ET.fromstring(resp.content).iter("{DAV:}href")
+    ]
+    assert hrefs == ["/files/test/a.txt"]
 
 
 @pytest.mark.asyncio
