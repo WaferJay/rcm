@@ -257,6 +257,10 @@ def test_load_webdav_config(tmp_path: Path) -> None:
               root: /srv/files
               path: files
               read_only: false
+              hide:
+                rcm: false
+                config: false
+                glob: ["**/*.tmp", "secret/**"]
               auth:
                 type: basic
                 username: alice
@@ -274,6 +278,10 @@ def test_load_webdav_config(tmp_path: Path) -> None:
     assert cfg.webdav.read_only is False
     assert cfg.webdav.auth.type == "basic"
     assert cfg.webdav.auth.username == "alice"
+    assert cfg.webdav.hide.rcm is False
+    assert cfg.webdav.hide.config is False
+    assert cfg.webdav.hide.glob == ["**/*.tmp", "secret/**"]
+    assert cfg.config_path == (tmp_path / "commands.yaml").resolve()
 
 
 @pytest.mark.parametrize(
@@ -283,6 +291,17 @@ def test_load_webdav_config(tmp_path: Path) -> None:
         ("{root: /tmp, path: /}", "must not be `/`"),
         ("{root: /tmp, path: /mcp/files}", "conflicts with a reserved path"),
         ("{root: /tmp, read_only: 1}", "must be a boolean"),
+        ("{root: /tmp, hide: {rcm: 1}}", "webdav.hide.rcm must be a boolean"),
+        ("{root: /tmp, hide: {config: 1}}", "webdav.hide.config must be a boolean"),
+        ("{root: /tmp, hide: {glob: '*.tmp'}}", "webdav.hide.glob must be a list"),
+        (
+            "{root: /tmp, hide: {glob: ['../secret']}}",
+            "must not contain empty, `.` or `..` path parts",
+        ),
+        (
+            "{root: /tmp, hide: {glob: ['[abc']}}",
+            "has an invalid character class",
+        ),
         ("{root: /tmp, auth: {type: unknown}}", "must be one of"),
         ("{root: /tmp, auth: {type: basic}}", "are required for basic auth"),
     ],

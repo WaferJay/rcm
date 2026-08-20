@@ -180,7 +180,7 @@ def build_http_app(mcp: FastMCP, cfg: Config, api_key: str) -> Starlette:
     if cfg.webdav is None:
         return mcp.http_app()
 
-    webdav_app = build_webdav_app(cfg.webdav, api_key)
+    webdav_app = build_webdav_app(cfg.webdav, api_key, cfg.config_path)
     mcp_app = mcp.http_app()
     webdav_mount = cfg.webdav.path.rstrip("/")
     return Starlette(

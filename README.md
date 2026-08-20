@@ -74,6 +74,10 @@ webdav:
   root: /srv/rcm-files
   path: /webdav/
   read_only: true
+  hide:
+    rcm: true
+    config: true
+    glob: ["**/*.tmp", "secret/**"]
   auth:
     type: bearer
 
@@ -157,6 +161,14 @@ The WebDAV path cannot overlap `/mcp`, `/runs`, or `/healthz`. Enable
 `read_only: false` only for a directory that is safe for remote modification.
 Use TLS directly or place a TLS-terminating reverse proxy in front of the
 service, especially when using Basic authentication.
+
+By default, WebDAV hides `.rcm/` directories and the YAML file loaded through
+`RCM_CONFIG`. These defaults can be controlled independently under
+`webdav.hide`. Additional files and directories can be hidden with relative
+POSIX glob patterns in `webdav.hide.glob`; patterns support `*`, `?`, character
+classes, and recursive `**`. A matched directory and its entire subtree are
+hidden from directory listings and direct access. Glob rules add to the default
+protected paths and cannot make them visible again.
 
 ## Calling from an agent
 

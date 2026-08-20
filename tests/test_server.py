@@ -19,6 +19,7 @@ from rcm.config import (
     ParamSpec,
     ServerSpec,
     WebDAVAuthSpec,
+    WebDAVHideSpec,
     WebDAVSpec,
 )
 from rcm.server import _build_tool_fn, build_server
@@ -278,6 +279,67 @@ async def test_webdav_readonly_mount(tmp_path: Path) -> None:
 
         resp = await h.put("/webdav/new.txt", content=b"new")
         assert resp.status_code >= 400
+
+
+@pytest.mark.asyncio
+async def test_webdav_hides_rcm_config_and_glob_matches(tmp_path: Path) -> None:
+    import httpx
+    import xml.etree.ElementTree as ET
+
+    from rcm.server import build_http_app
+
+    config_path = tmp_path / "commands.yaml"
+    config_path.write_text("commands: []\n", encoding="utf-8")
+    (tmp_path / ".rcm").mkdir()
+    (tmp_path / ".rcm" / "private.txt").write_text("private", encoding="utf-8")
+    (tmp_path / "visible.txt").write_text("visible", encoding="utf-8")
+    (tmp_path / "notes.tmp").write_text("temporary", encoding="utf-8")
+    (tmp_path / "secret").mkdir()
+    (tmp_path / "secret" / "private.txt").write_text(
+        "private", encoding="utf-8"
+    )
+
+    cfg = Config(
+        server=ServerSpec(public_base_url="http://testserver"),
+        auth=AuthSpec(api_key=None),
+        defaults=DefaultsSpec(),
+        commands=[],
+        config_path=config_path,
+        webdav=WebDAVSpec(
+            root=str(tmp_path),
+            auth=WebDAVAuthSpec(type="none"),
+            hide=WebDAVHideSpec(glob=["**/*.tmp", "secret/**"]),
+        ),
+    )
+    mcp = build_server(cfg, Store(tmp_path / "runs", "http://testserver"), "key")
+    app = build_http_app(mcp, cfg, "key")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as h:
+        resp = await h.request("PROPFIND", "/webdav/", headers={"Depth": "1"})
+        assert resp.status_code == 207
+        hrefs = [
+            element.text
+            for element in ET.fromstring(resp.content).iter("{DAV:}href")
+        ]
+        assert "/webdav/visible.txt" in hrefs
+        assert "/webdav/.rcm/" not in hrefs
+        assert "/webdav/commands.yaml" not in hrefs
+        assert "/webdav/notes.tmp" not in hrefs
+        assert "/webdav/secret/" not in hrefs
+
+        for path in (
+            "/webdav/.rcm/private.txt",
+            "/webdav/commands.yaml",
+            "/webdav/notes.tmp",
+            "/webdav/secret/private.txt",
+        ):
+            resp = await h.get(path)
+            assert resp.status_code == 404, path
+
+        resp = await h.get("/webdav/visible.txt")
+        assert resp.status_code == 200
+        assert resp.text == "visible"
 
 
 @pytest.mark.asyncio

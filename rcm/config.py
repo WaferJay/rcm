@@ -77,11 +77,19 @@ class WebDAVAuthSpec:
 
 
 @dataclass
+class WebDAVHideSpec:
+    rcm: bool = True
+    config: bool = True
+    glob: list[str] = field(default_factory=list)
+
+
+@dataclass
 class WebDAVSpec:
     root: str
     path: str = "/webdav/"
     read_only: bool = True
     auth: WebDAVAuthSpec = field(default_factory=WebDAVAuthSpec)
+    hide: WebDAVHideSpec = field(default_factory=WebDAVHideSpec)
 
 
 @dataclass
@@ -91,6 +99,7 @@ class Config:
     defaults: DefaultsSpec
     commands: list[CommandSpec]
     webdav: WebDAVSpec | None = None
+    config_path: Path | None = None
 
 
 def _placeholders(s: str) -> list[str]:
@@ -220,6 +229,66 @@ def _normalize_webdav_path(path: Any) -> str:
     return normalized + "/"
 
 
+def _validate_webdav_glob(pattern: Any, index: int) -> str:
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise ConfigError(
+            f"webdav.hide.glob[{index}] must be a non-empty string"
+        )
+    pattern = pattern.strip()
+    if pattern.startswith("/") or "\\" in pattern:
+        raise ConfigError(
+            f"webdav.hide.glob[{index}] must be a relative POSIX glob"
+        )
+
+    parts = pattern.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ConfigError(
+            f"webdav.hide.glob[{index}] must not contain empty, `.` or `..` path parts"
+        )
+    for part in parts:
+        bracket_open = False
+        for char in part:
+            if char == "[":
+                if bracket_open:
+                    raise ConfigError(
+                        f"webdav.hide.glob[{index}] has an invalid character class"
+                    )
+                bracket_open = True
+            elif char == "]":
+                if not bracket_open:
+                    raise ConfigError(
+                        f"webdav.hide.glob[{index}] has an invalid character class"
+                    )
+                bracket_open = False
+        if bracket_open:
+            raise ConfigError(
+                f"webdav.hide.glob[{index}] has an invalid character class"
+            )
+    return pattern
+
+
+def _parse_webdav_hide(raw: Any) -> WebDAVHideSpec:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("webdav.hide must be a mapping")
+
+    rcm = raw.get("rcm", True)
+    if not isinstance(rcm, bool):
+        raise ConfigError("webdav.hide.rcm must be a boolean")
+
+    config = raw.get("config", True)
+    if not isinstance(config, bool):
+        raise ConfigError("webdav.hide.config must be a boolean")
+
+    glob_raw = raw.get("glob", [])
+    if not isinstance(glob_raw, list):
+        raise ConfigError("webdav.hide.glob must be a list")
+    glob = [_validate_webdav_glob(pattern, i) for i, pattern in enumerate(glob_raw)]
+
+    return WebDAVHideSpec(rcm=rcm, config=config, glob=glob)
+
+
 def _parse_tls(raw: Any) -> TLSConfig:
     if not isinstance(raw, dict):
         raise ConfigError("server.tls must be a mapping")
@@ -317,11 +386,12 @@ def _parse_webdav(raw: Any) -> WebDAVSpec:
             username=username,
             password=password,
         ),
+        hide=_parse_webdav_hide(raw.get("hide")),
     )
 
 
 def load_config(path: str | Path) -> Config:
-    path = Path(path)
+    path = Path(path).expanduser().resolve()
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -375,4 +445,5 @@ def load_config(path: str | Path) -> Config:
         defaults=defaults,
         commands=commands,
         webdav=webdav,
+        config_path=path,
     )
