@@ -6,6 +6,14 @@ server:
   # Required (here or via RCM_PUBLIC_BASE_URL).
   public_base_url: https://rcm.example.com
 
+  # Optional native HTTPS. Omit this block for HTTP or a reverse-proxy setup.
+  # tls:
+  #   enabled: true
+  #   auto_generate: true
+  #   # Additional DNS names or IP addresses for the generated certificate.
+  #   hostnames: [rcm.internal.example.com]
+  # For manually managed certificates, use cert_file and key_file instead.
+
 # Optional WebDAV share on the same port.
 # webdav:
 #   root: /srv/rcm-files

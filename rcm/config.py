@@ -42,10 +42,20 @@ class CommandSpec:
 
 
 @dataclass
+class TLSConfig:
+    enabled: bool = False
+    cert_file: str | None = None
+    key_file: str | None = None
+    auto_generate: bool = False
+    hostnames: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ServerSpec:
     host: str | None = None
     port: int | None = None
     public_base_url: str | None = None
+    tls: TLSConfig = field(default_factory=TLSConfig)
 
 
 @dataclass
@@ -210,6 +220,59 @@ def _normalize_webdav_path(path: Any) -> str:
     return normalized + "/"
 
 
+def _parse_tls(raw: Any) -> TLSConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("server.tls must be a mapping")
+
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("server.tls.enabled must be a boolean")
+
+    auto_generate = raw.get("auto_generate", False)
+    if not isinstance(auto_generate, bool):
+        raise ConfigError("server.tls.auto_generate must be a boolean")
+
+    cert_file = raw.get("cert_file")
+    if cert_file is not None and (
+        not isinstance(cert_file, str) or not cert_file.strip()
+    ):
+        raise ConfigError("server.tls.cert_file must be a non-empty string")
+
+    key_file = raw.get("key_file")
+    if key_file is not None and (
+        not isinstance(key_file, str) or not key_file.strip()
+    ):
+        raise ConfigError("server.tls.key_file must be a non-empty string")
+
+    hostnames_raw = raw.get("hostnames", [])
+    if not isinstance(hostnames_raw, list):
+        raise ConfigError("server.tls.hostnames must be a list")
+    hostnames: list[str] = []
+    for i, hostname in enumerate(hostnames_raw):
+        if not isinstance(hostname, str) or not hostname.strip():
+            raise ConfigError(
+                f"server.tls.hostnames[{i}] must be a non-empty string"
+            )
+        hostnames.append(hostname.strip())
+
+    if enabled and ((cert_file is None) != (key_file is None)):
+        raise ConfigError(
+            "server.tls.cert_file and server.tls.key_file must be provided together"
+        )
+    if enabled and cert_file is None and key_file is None and not auto_generate:
+        raise ConfigError(
+            "server.tls requires cert_file/key_file or auto_generate: true"
+        )
+
+    return TLSConfig(
+        enabled=enabled,
+        cert_file=cert_file,
+        key_file=key_file,
+        auto_generate=auto_generate,
+        hostnames=hostnames,
+    )
+
+
 def _parse_webdav(raw: Any) -> WebDAVSpec:
     if not isinstance(raw, dict):
         raise ConfigError("`webdav` must be a mapping")
@@ -275,6 +338,7 @@ def load_config(path: str | Path) -> Config:
         host=server_raw.get("host"),
         port=int(server_raw["port"]) if server_raw.get("port") is not None else None,
         public_base_url=server_raw.get("public_base_url"),
+        tls=_parse_tls(server_raw.get("tls") or {}),
     )
 
     auth_raw = raw.get("auth") or {}

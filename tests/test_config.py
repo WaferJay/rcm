@@ -34,6 +34,30 @@ def test_load_minimal_config(tmp_path: Path) -> None:
     assert [c.name for c in cfg.commands] == ["hello"]
     assert cfg.commands[0].command == ["echo", "hi"]
     assert cfg.commands[0].params == []
+    assert cfg.server.tls.enabled is False
+
+
+def test_load_tls_config(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            server:
+              public_base_url: https://example.com
+              tls:
+                enabled: true
+                auto_generate: true
+                hostnames: [internal.example.com, 10.0.0.5]
+            commands:
+              - name: hello
+                description: Say hello.
+                command: ["echo", "hi"]
+            """,
+        )
+    )
+    assert cfg.server.tls.enabled is True
+    assert cfg.server.tls.auto_generate is True
+    assert cfg.server.tls.hostnames == ["internal.example.com", "10.0.0.5"]
 
 
 def test_full_command_with_params_and_defaults(tmp_path: Path) -> None:
@@ -181,6 +205,33 @@ def test_full_command_with_params_and_defaults(tmp_path: Path) -> None:
                 command: ["echo", 1]
             """,
             "must be a string",
+        ),
+        # malformed TLS configuration
+        (
+            """
+            server:
+              public_base_url: https://x
+              tls: {enabled: true}
+            commands:
+              - name: a
+                description: x
+                command: ["a"]
+            """,
+            "requires cert_file/key_file or auto_generate",
+        ),
+        (
+            """
+            server:
+              public_base_url: https://x
+              tls:
+                enabled: true
+                cert_file: cert.pem
+            commands:
+              - name: a
+                description: x
+                command: ["a"]
+            """,
+            "must be provided together",
         ),
     ],
 )

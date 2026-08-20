@@ -7,7 +7,7 @@ named MCP tools, served over **HTTP Streaming** (Streamable HTTP transport).
 - Calling a tool runs the command with `shell=False` (no shell expansion),
   records stdout/stderr to disk, and returns just `run_id` + exit code +
   byte counts + absolute download URLs.
-- Stdout/stderr are downloaded over plain HTTP from
+- Stdout/stderr are downloaded over HTTP or HTTPS from
   `/runs/<run_id>/{stdout,stderr,meta}`. These endpoints are intentionally
   **public**; access is gated by the unguessable 256-bit `run_id`
   (capability URLs).
@@ -64,6 +64,11 @@ server:
   host: 0.0.0.0
   port: 8000
   public_base_url: https://rcm.example.com
+  # Optional native HTTPS; omit this block for HTTP.
+  tls:
+    enabled: true
+    cert_file: /etc/rcm/server-cert.pem
+    key_file: /etc/rcm/server-key.pem
 
 webdav:
   root: /srv/rcm-files
@@ -95,6 +100,44 @@ Rules:
 - `params[*].type` is one of `string`, `integer`, `number`, `boolean`.
 - Optional per-param: `description`, `default`, `pattern` (regex), `enum`.
 - `name` must match `^[a-zA-Z_][a-zA-Z0-9_]*$` and be globally unique.
+
+## HTTPS and self-signed certificates
+
+Native HTTPS is enabled with `server.tls.enabled: true`. The server requires
+`server.public_base_url` to use the `https://` scheme in this mode. For a
+manually managed certificate, provide both `cert_file` and `key_file`; paths
+relative to the YAML file are resolved relative to that file.
+
+For a self-signed certificate, let rcm generate and reuse one beside the
+configuration file:
+
+```yaml
+server:
+  public_base_url: https://rcm.example.com
+  tls:
+    enabled: true
+    auto_generate: true
+    # Optional additional DNS names or IP addresses.
+    hostnames: [rcm.internal.example.com, 192.168.1.20]
+```
+
+The generated files are `.rcm/rcm-cert.pem` and `.rcm/rcm-key.pem`. Import
+`rcm-cert.pem` into the client host's trust store (or configure it as the
+client's CA file), for example:
+
+```bash
+curl --cacert .rcm/rcm-cert.pem https://rcm.example.com/healthz
+```
+
+When `public_base_url` is present, its hostname is included in the generated
+certificate SANs. If it is unavailable, configure at least one value in
+`server.tls.hostnames`. `localhost` and `127.0.0.1` are included automatically.
+Do not disable certificate verification globally in clients; trust the
+generated certificate explicitly instead.
+
+When rcm runs behind a TLS-terminating reverse proxy, leave `server.tls`
+disabled. rcm then listens on HTTP while `public_base_url` can remain an
+`https://` URL for links returned to clients.
 
 ## WebDAV
 
@@ -157,6 +200,10 @@ curl 'https://rcm.example.com/runs/k7Q.../stdout?tail=4096'
 | `RCM_PUBLIC_BASE_URL` | Public URL used to build absolute download links. Required (here or in YAML). |
 | `RCM_CONFIG` | Path to YAML config (default: `./commands.yaml`). |
 | `RCM_HOST` / `RCM_PORT` | Bind address/port (defaults: `0.0.0.0` / `8000`). |
+| `RCM_TLS_ENABLED` | Overrides `server.tls.enabled`. |
+| `RCM_TLS_CERT_FILE` / `RCM_TLS_KEY_FILE` | Overrides the configured certificate/key paths. |
+| `RCM_TLS_AUTO_GENERATE` | Overrides `server.tls.auto_generate`. |
+| `RCM_TLS_HOSTNAMES` | Comma-separated SAN hostnames/IP addresses. |
 | `RCM_RUNS_DIR` | Where stdout/stderr/meta are written (default: `./runs`). |
 | `RCM_RUNS_RETENTION` | Keep at most N runs on disk (pruned at startup). `0` = keep all. |
 | `RCM_WEBDAV_PASSWORD` | Overrides the configured WebDAV Basic-auth password. |
@@ -192,5 +239,6 @@ packages are installed and includes them. Key caveats:
 
 ## Notes
 
-- Put a TLS-terminating reverse proxy (nginx/caddy) in front in production.
+- Use a TLS-terminating reverse proxy (nginx/caddy) when preferred; configure
+  rcm for HTTP in that deployment.
 - v1 has a single global API key; per-tool authorization is out of scope.

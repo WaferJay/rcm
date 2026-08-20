@@ -6,8 +6,10 @@ import inspect
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastmcp import FastMCP
 from starlette.applications import Starlette
@@ -16,9 +18,10 @@ from starlette.routing import Mount
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 from .auth import ApiKeyAuth
-from .config import CommandSpec, Config, ParamSpec, load_config
+from .config import CommandSpec, Config, ParamSpec, TLSConfig, load_config
 from .runner import run_command
 from .store import RUN_ID_RE, Store
+from .tls import TLSConfigError, prepare_tls, uvicorn_tls_config
 from .webdav import WebDAVError, build_webdav_app
 
 PY_TYPES: dict[str, type] = {
@@ -189,6 +192,46 @@ def build_http_app(mcp: FastMCP, cfg: Config, api_key: str) -> Starlette:
     )
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+def _env_path(name: str, default: str | None) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    if not value.strip():
+        raise ValueError(f"{name} must be a non-empty path")
+    return value
+
+
+def _effective_tls_config(config: TLSConfig) -> TLSConfig:
+    hostnames_raw = os.environ.get("RCM_TLS_HOSTNAMES")
+    if hostnames_raw is None:
+        hostnames = config.hostnames
+    else:
+        hostnames = [hostname.strip() for hostname in hostnames_raw.split(",")]
+        if not hostnames or any(not hostname for hostname in hostnames):
+            raise ValueError("RCM_TLS_HOSTNAMES must contain non-empty hostnames")
+
+    return replace(
+        config,
+        enabled=_env_bool("RCM_TLS_ENABLED", config.enabled),
+        cert_file=_env_path("RCM_TLS_CERT_FILE", config.cert_file),
+        key_file=_env_path("RCM_TLS_KEY_FILE", config.key_file),
+        auto_generate=_env_bool("RCM_TLS_AUTO_GENERATE", config.auto_generate),
+        hostnames=hostnames,
+    )
+
+
 def main() -> None:
     cfg_path = os.environ.get("RCM_CONFIG", "commands.yaml")
     try:
@@ -209,6 +252,19 @@ def main() -> None:
             "(set RCM_PUBLIC_BASE_URL or server.public_base_url)"
         )
 
+    try:
+        tls_config = _effective_tls_config(cfg.server.tls)
+        if (
+            tls_config.enabled
+            and urlsplit(public_base_url).scheme.lower() != "https"
+        ):
+            raise TLSConfigError(
+                "server.public_base_url must use https when TLS is enabled"
+            )
+        tls_files = prepare_tls(cfg_path, tls_config, public_base_url)
+    except (TLSConfigError, ValueError) as e:
+        sys.exit(f"rcm: failed to configure TLS: {e}")
+
     runs_dir = Path(os.environ.get("RCM_RUNS_DIR", "./runs")).resolve()
     runs_dir.mkdir(parents=True, exist_ok=True)
     store = Store(runs_dir, public_base_url=public_base_url)
@@ -225,14 +281,21 @@ def main() -> None:
     port = int(os.environ.get("RCM_PORT") or cfg.server.port or 8000)
 
     mcp = build_server(cfg, store, api_key)
+    uvicorn_config = uvicorn_tls_config(tls_files)
+    scheme = "https" if tls_files is not None else "http"
 
     print(
         f"rcm: serving {len(cfg.commands)} command tool(s) "
-        f"on http://{host}:{port}/mcp/  (public base: {public_base_url})",
+        f"on {scheme}://{host}:{port}/mcp/  (public base: {public_base_url})",
         file=sys.stderr,
     )
     if cfg.webdav is None:
-        mcp.run(transport="http", host=host, port=port)
+        mcp.run(
+            transport="http",
+            host=host,
+            port=port,
+            uvicorn_config=uvicorn_config,
+        )
         return
 
     try:
@@ -241,9 +304,9 @@ def main() -> None:
         sys.exit(f"rcm: failed to configure WebDAV: {e}")
 
     print(
-        f"rcm: WebDAV available at http://{host}:{port}{cfg.webdav.path}",
+        f"rcm: WebDAV available at {scheme}://{host}:{port}{cfg.webdav.path}",
         file=sys.stderr,
     )
     import uvicorn
 
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, **uvicorn_config)
