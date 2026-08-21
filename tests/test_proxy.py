@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import socket
+from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 from fastmcp import FastMCP
@@ -82,6 +85,52 @@ async def test_proxy_tool_blocks_call_when_sync_fails() -> None:
 
 
 @pytest.mark.asyncio
+async def test_proxy_tool_materializes_rcm_inline_artifact(tmp_path) -> None:
+    stdout = b"\x00remote\xff\n"
+    stderr = b"warning\n"
+
+    class ArtifactClient:
+        async def call_tool_mcp(self, name: str, arguments: dict) -> CallToolResult:
+            return CallToolResult(
+                content=[],
+                structuredContent={
+                    "artifact_protocol": "rcm-inline-base64-v1",
+                    "run_id": "remote-run",
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout_bytes": len(stdout),
+                    "stderr_bytes": len(stderr),
+                    "stdout_base64": base64.b64encode(stdout).decode("ascii"),
+                    "stderr_base64": base64.b64encode(stderr).decode("ascii"),
+                },
+            )
+
+    store = Store(tmp_path / "runs", (tmp_path / "runs").as_uri(), local_urls=True)
+    tool = ProxyTool(
+        public_name="remote__build",
+        target_name="remote",
+        remote_name="build",
+        description=None,
+        parameters={"type": "object", "properties": {}},
+        output_schema=None,
+        client=ArtifactClient(),
+        sync=None,
+        store=store,
+    )
+
+    result = await tool.run({})
+    data = result.structured_content
+    assert data["run_id"] != "remote-run"
+    assert data["stdout_url"].startswith("file://")
+    assert data["stderr_url"].startswith("file://")
+    assert "stdout_base64" not in data
+    assert "stderr_base64" not in data
+    assert "artifact_protocol" not in data
+    assert Path(urlparse(data["stdout_url"]).path).read_bytes() == stdout
+    assert Path(urlparse(data["stderr_url"]).path).read_bytes() == stderr
+
+
+@pytest.mark.asyncio
 async def test_proxy_runtime_discovers_and_registers_stdio_tools(tmp_path) -> None:
     import sys
 
@@ -124,6 +173,59 @@ mcp.run()
         assert tool is not None
         result = await tool.run({"value": "ok"})
         assert result.content[0].text == "ok"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_proxy_runtime_recovers_remote_rcm_artifact(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    remote_config = tmp_path / "remote-commands.yaml"
+    code = (
+        "import sys; sys.stdout.buffer.write(bytes([0, 255])); "
+        "sys.stderr.buffer.write(b'err')"
+    )
+    remote_config.write_text(
+        f"commands:\n"
+        f"  - name: remote_binary\n"
+        f"    description: Remote binary output.\n"
+        f"    command: [{sys.executable!r}, '-c', {code!r}]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RCM_CONFIG", str(remote_config))
+    monkeypatch.setenv("RCM_RUNS_DIR", str(tmp_path / "remote-runs"))
+
+    cfg = Config(
+        server=ServerSpec(),
+        auth=AuthSpec(api_key=None),
+        defaults=DefaultsSpec(),
+        commands=[],
+        mode="proxy",
+        proxy=ProxySpec(
+            targets=[
+                ProxyTargetSpec(
+                    name="remote",
+                    transport="stdio",
+                    command=[sys.executable, "-m", "rcm", "--stdio"],
+                )
+            ]
+        ),
+    )
+    store = Store(tmp_path / "local-runs", (tmp_path / "local-runs").as_uri(), local_urls=True)
+    mcp, runtime = await build_proxy_server(cfg, store, None)
+    try:
+        tool = await mcp.get_tool("remote__remote_binary")
+        assert tool is not None
+        result = await tool.run({})
+        data = result.structured_content
+        assert data["stdout_url"].startswith("file://")
+        assert data["stderr_url"].startswith("file://")
+        assert Path(urlparse(data["stdout_url"]).path).read_bytes() == bytes([0, 255])
+        assert Path(urlparse(data["stderr_url"]).path).read_bytes() == b"err"
+        assert "stdout_base64" not in data
     finally:
         await runtime.close()
 

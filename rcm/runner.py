@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import os
 import re
 import string
 import time
@@ -10,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import CommandSpec, ParamSpec
+from .artifacts import ARTIFACT_ENV, ARTIFACT_ENV_VALUE, ARTIFACT_PROTOCOL
 from .store import Store
 
 
@@ -212,7 +215,7 @@ def _safe_size(path) -> int:
 
 def _public_result(meta: dict[str, Any], store: Store) -> dict[str, Any]:
     run_id = meta["run_id"]
-    return {
+    result = {
         "run_id": run_id,
         "returncode": meta["returncode"],
         "timed_out": meta["timed_out"],
@@ -222,3 +225,14 @@ def _public_result(meta: dict[str, Any], store: Store) -> dict[str, Any]:
         "stdout_url": store.url_for(run_id, "stdout"),
         "stderr_url": store.url_for(run_id, "stderr"),
     }
+    if os.environ.get(ARTIFACT_ENV) == ARTIFACT_ENV_VALUE:
+        result["artifact_protocol"] = ARTIFACT_PROTOCOL
+        result["stdout_base64"] = base64.b64encode(
+            store.file_path(run_id, "stdout").read_bytes()
+        ).decode("ascii")
+        result["stderr_base64"] = base64.b64encode(
+            store.file_path(run_id, "stderr").read_bytes()
+        ).decode("ascii")
+        result.pop("stdout_url")
+        result.pop("stderr_url")
+    return result

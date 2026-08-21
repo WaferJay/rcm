@@ -18,9 +18,16 @@ class StoreError(Exception):
 
 
 class Store:
-    def __init__(self, runs_dir: Path, public_base_url: str) -> None:
+    def __init__(
+        self,
+        runs_dir: Path,
+        public_base_url: str,
+        *,
+        local_urls: bool = False,
+    ) -> None:
         self.runs_dir = runs_dir
         self.public_base_url = public_base_url.rstrip("/")
+        self.local_urls = local_urls
         self.runs_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -50,6 +57,8 @@ class Store:
         raise StoreError(f"unknown stream {stream!r}")
 
     def url_for(self, run_id: str, stream: Stream) -> str:
+        if self.local_urls:
+            return self.file_path(run_id, stream).resolve().as_uri()
         # capability URL: relies on run_id randomness for confidentiality.
         return f"{self.public_base_url}/runs/{run_id}/{stream}"
 

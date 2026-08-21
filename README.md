@@ -1,7 +1,7 @@
 # rcm — Remote Command MCP Server
 
 A small MCP server that exposes a **fixed allow-list** of shell commands as
-named MCP tools, served over **HTTP Streaming** (Streamable HTTP transport).
+named MCP tools, served over Streamable HTTP or stdio.
 
 - Each command in the YAML config becomes one named MCP tool.
 - Calling a tool runs the command with `shell=False` (no shell expansion),
@@ -11,8 +11,8 @@ named MCP tools, served over **HTTP Streaming** (Streamable HTTP transport).
   `/runs/<run_id>/{stdout,stderr,meta}`. These endpoints are intentionally
   **public**; access is gated by the unguessable 256-bit `run_id`
   (capability URLs).
-- The MCP endpoint itself requires `Authorization: Bearer <RCM_API_KEY>`.
-- An optional WebDAV share can be mounted on the same HTTP server.
+- The HTTP MCP endpoint requires `Authorization: Bearer <RCM_API_KEY>`;
+  stdio mode does not use API-key authentication.
 - Proxy mode can aggregate local or remote MCP servers and synchronize a local
   workspace before each proxied tool call.
 
@@ -32,6 +32,9 @@ echo "API key: $RCM_API_KEY"
 uv run python -m rcm
 # MCP endpoint:    $RCM_PUBLIC_BASE_URL/mcp/
 # Output download: $RCM_PUBLIC_BASE_URL/runs/<run_id>/{stdout,stderr,meta}
+
+# For a local MCP client, use stdio. API key and public_base_url are not needed.
+uv run python -m rcm --stdio
 ```
 
 After installing or publishing the package, the CLI can also be invoked from
@@ -71,17 +74,6 @@ server:
     enabled: true
     cert_file: /etc/rcm/server-cert.pem
     key_file: /etc/rcm/server-key.pem
-
-webdav:
-  root: /srv/rcm-files
-  path: /webdav/
-  read_only: true
-  hide:
-    rcm: true
-    config: true
-    glob: ["**/*.tmp", "secret/**"]
-  auth:
-    type: bearer
 
 defaults:
   timeout: 30
@@ -166,6 +158,11 @@ available. SSH credentials are taken from the local OpenSSH configuration,
 agent, and keys. The local machine must provide `rsync` for synchronized
 targets and `ssh` for SSH targets.
 
+When a proxy starts a stdio or SSH child, it marks the child with an internal
+rcm artifact protocol. A child rcm server returns command output as base64;
+the local proxy stores it locally and returns local `file://` URLs. Results
+from non-rcm MCP services are passed through unchanged.
+
 ## HTTPS and self-signed certificates
 
 Native HTTPS is enabled with `server.tls.enabled: true`. The server requires
@@ -203,33 +200,6 @@ generated certificate explicitly instead.
 When rcm runs behind a TLS-terminating reverse proxy, leave `server.tls`
 disabled. rcm then listens on HTTP while `public_base_url` can remain an
 `https://` URL for links returned to clients.
-
-## WebDAV
-
-WebDAV is enabled when the `webdav` section is present. The root must already
-exist and be a directory. The default path is `/webdav/`, the default mode is
-read-only, and the default authentication type is `bearer`, which reuses
-`RCM_API_KEY`.
-
-Authentication types:
-
-- `bearer`: use `Authorization: Bearer <RCM_API_KEY>`.
-- `basic`: provide `username` and `password` under `webdav.auth`. The password
-  can be overridden with `RCM_WEBDAV_PASSWORD`.
-- `none`: allow anonymous access.
-
-The WebDAV path cannot overlap `/mcp`, `/runs`, or `/healthz`. Enable
-`read_only: false` only for a directory that is safe for remote modification.
-Use TLS directly or place a TLS-terminating reverse proxy in front of the
-service, especially when using Basic authentication.
-
-By default, WebDAV hides `.rcm/` directories and the YAML file loaded through
-`RCM_CONFIG`. These defaults can be controlled independently under
-`webdav.hide`. Additional files and directories can be hidden with relative
-POSIX glob patterns in `webdav.hide.glob`; patterns support `*`, `?`, character
-classes, and recursive `**`. A matched directory and its entire subtree are
-hidden from directory listings and direct access. Glob rules add to the default
-protected paths and cannot make them visible again.
 
 ## Calling from an agent
 
@@ -272,8 +242,8 @@ curl 'https://rcm.example.com/runs/k7Q.../stdout?tail=4096'
 
 | Variable | Purpose |
 |---|---|
-| `RCM_API_KEY` | Bearer token required for MCP requests. Required. |
-| `RCM_PUBLIC_BASE_URL` | Public URL used to build absolute download links. Required (here or in YAML). |
+| `RCM_API_KEY` | Bearer token for HTTP MCP requests; required in HTTP mode and ignored in stdio mode. |
+| `RCM_PUBLIC_BASE_URL` | Public URL used to build HTTP download links. Required in HTTP mode (here or in YAML). |
 | `RCM_CONFIG` | Path to YAML config (default: `./commands.yaml`). |
 | `RCM_HOST` / `RCM_PORT` | Bind address/port (defaults: `0.0.0.0` / `8000`). |
 | `RCM_TLS_ENABLED` | Overrides `server.tls.enabled`. |
@@ -282,7 +252,6 @@ curl 'https://rcm.example.com/runs/k7Q.../stdout?tail=4096'
 | `RCM_TLS_HOSTNAMES` | Comma-separated SAN hostnames/IP addresses. |
 | `RCM_RUNS_DIR` | Where stdout/stderr/meta are written (default: `./runs`). |
 | `RCM_RUNS_RETENTION` | Keep at most N runs on disk (pruned at startup). `0` = keep all. |
-| `RCM_WEBDAV_PASSWORD` | Overrides the configured WebDAV Basic-auth password. |
 | Target header `env` values | Environment variables referenced by proxy target headers are resolved at startup. |
 
 ## Building a standalone binary (Nuitka)

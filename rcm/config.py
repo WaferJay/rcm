@@ -12,8 +12,6 @@ import yaml
 
 NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 PARAM_TYPES = {"string", "integer", "number", "boolean"}
-WEBDAV_AUTH_TYPES = {"basic", "bearer", "none"}
-WEBDAV_RESERVED_PATHS = ("/mcp", "/runs", "/healthz")
 MODES = {"server", "proxy"}
 PROXY_TRANSPORTS = {"stdio", "ssh", "http", "sse"}
 
@@ -72,29 +70,6 @@ class DefaultsSpec:
 
 
 @dataclass
-class WebDAVAuthSpec:
-    type: str = "bearer"
-    username: str | None = None
-    password: str | None = None
-
-
-@dataclass
-class WebDAVHideSpec:
-    rcm: bool = True
-    config: bool = True
-    glob: list[str] = field(default_factory=list)
-
-
-@dataclass
-class WebDAVSpec:
-    root: str
-    path: str = "/webdav/"
-    read_only: bool = True
-    auth: WebDAVAuthSpec = field(default_factory=WebDAVAuthSpec)
-    hide: WebDAVHideSpec = field(default_factory=WebDAVHideSpec)
-
-
-@dataclass
 class HeaderSpec:
     env: str | None = None
     value: str | None = None
@@ -139,7 +114,6 @@ class Config:
     commands: list[CommandSpec]
     mode: str = "server"
     proxy: ProxySpec | None = None
-    webdav: WebDAVSpec | None = None
     config_path: Path | None = None
 
 
@@ -250,84 +224,6 @@ def _parse_command(raw: dict[str, Any]) -> CommandSpec:
         timeout=float(timeout) if timeout is not None else None,
         cwd=cwd,
     )
-
-
-def _normalize_webdav_path(path: Any) -> str:
-    if not isinstance(path, str) or not path.strip():
-        raise ConfigError("webdav.path must be a non-empty string")
-
-    normalized = "/" + path.strip().strip("/")
-    if normalized == "/":
-        raise ConfigError("webdav.path must not be `/`")
-    if any(
-        normalized == reserved or normalized.startswith(reserved + "/")
-        for reserved in WEBDAV_RESERVED_PATHS
-    ):
-        raise ConfigError(
-            f"webdav.path {path!r} conflicts with a reserved path; "
-            f"reserved paths are {list(WEBDAV_RESERVED_PATHS)!r}"
-        )
-    return normalized + "/"
-
-
-def _validate_webdav_glob(pattern: Any, index: int) -> str:
-    if not isinstance(pattern, str) or not pattern.strip():
-        raise ConfigError(
-            f"webdav.hide.glob[{index}] must be a non-empty string"
-        )
-    pattern = pattern.strip()
-    if pattern.startswith("/") or "\\" in pattern:
-        raise ConfigError(
-            f"webdav.hide.glob[{index}] must be a relative POSIX glob"
-        )
-
-    parts = pattern.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
-        raise ConfigError(
-            f"webdav.hide.glob[{index}] must not contain empty, `.` or `..` path parts"
-        )
-    for part in parts:
-        bracket_open = False
-        for char in part:
-            if char == "[":
-                if bracket_open:
-                    raise ConfigError(
-                        f"webdav.hide.glob[{index}] has an invalid character class"
-                    )
-                bracket_open = True
-            elif char == "]":
-                if not bracket_open:
-                    raise ConfigError(
-                        f"webdav.hide.glob[{index}] has an invalid character class"
-                    )
-                bracket_open = False
-        if bracket_open:
-            raise ConfigError(
-                f"webdav.hide.glob[{index}] has an invalid character class"
-            )
-    return pattern
-
-
-def _parse_webdav_hide(raw: Any) -> WebDAVHideSpec:
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise ConfigError("webdav.hide must be a mapping")
-
-    rcm = raw.get("rcm", True)
-    if not isinstance(rcm, bool):
-        raise ConfigError("webdav.hide.rcm must be a boolean")
-
-    config = raw.get("config", True)
-    if not isinstance(config, bool):
-        raise ConfigError("webdav.hide.config must be a boolean")
-
-    glob_raw = raw.get("glob", [])
-    if not isinstance(glob_raw, list):
-        raise ConfigError("webdav.hide.glob must be a list")
-    glob = [_validate_webdav_glob(pattern, i) for i, pattern in enumerate(glob_raw)]
-
-    return WebDAVHideSpec(rcm=rcm, config=config, glob=glob)
 
 
 def _validate_proxy_glob(pattern: Any, index: int) -> str:
@@ -581,54 +477,6 @@ def _parse_tls(raw: Any) -> TLSConfig:
     )
 
 
-def _parse_webdav(raw: Any) -> WebDAVSpec:
-    if not isinstance(raw, dict):
-        raise ConfigError("`webdav` must be a mapping")
-
-    root = raw.get("root")
-    if not isinstance(root, str) or not root.strip():
-        raise ConfigError("webdav.root must be a non-empty string")
-
-    read_only = raw.get("read_only", True)
-    if not isinstance(read_only, bool):
-        raise ConfigError("webdav.read_only must be a boolean")
-
-    auth_raw = raw.get("auth")
-    if auth_raw is None:
-        auth_raw = {}
-    if not isinstance(auth_raw, dict):
-        raise ConfigError("webdav.auth must be a mapping")
-    auth_type = auth_raw.get("type", "bearer")
-    if not isinstance(auth_type, str) or auth_type not in WEBDAV_AUTH_TYPES:
-        raise ConfigError(
-            "webdav.auth.type must be one of "
-            f"{sorted(WEBDAV_AUTH_TYPES)}, got {auth_type!r}"
-        )
-
-    username = auth_raw.get("username")
-    password = auth_raw.get("password")
-    if username is not None and (not isinstance(username, str) or not username):
-        raise ConfigError("webdav.auth.username must be a non-empty string")
-    if password is not None and (not isinstance(password, str) or not password):
-        raise ConfigError("webdav.auth.password must be a non-empty string")
-    if auth_type == "basic" and (username is None or password is None):
-        raise ConfigError(
-            "webdav.auth.username and webdav.auth.password are required for basic auth"
-        )
-
-    return WebDAVSpec(
-        root=root,
-        path=_normalize_webdav_path(raw.get("path", "/webdav/")),
-        read_only=read_only,
-        auth=WebDAVAuthSpec(
-            type=auth_type,
-            username=username,
-            password=password,
-        ),
-        hide=_parse_webdav_hide(raw.get("hide")),
-    )
-
-
 def load_config(path: str | Path) -> Config:
     path = Path(path).expanduser().resolve()
     try:
@@ -639,6 +487,8 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError(f"invalid YAML in {path}: {e}")
     if not isinstance(raw, dict):
         raise ConfigError(f"top-level YAML must be a mapping in {path}")
+    if "webdav" in raw:
+        raise ConfigError("`webdav` is no longer supported")
 
     mode = raw.get("mode", "server")
     if not isinstance(mode, str) or mode not in MODES:
@@ -686,8 +536,6 @@ def load_config(path: str | Path) -> Config:
     if mode == "server" and proxy is not None:
         raise ConfigError("`proxy` is only valid when mode is `proxy`")
 
-    webdav = _parse_webdav(raw["webdav"]) if "webdav" in raw else None
-
     return Config(
         server=server,
         auth=auth,
@@ -695,6 +543,5 @@ def load_config(path: str | Path) -> Config:
         commands=commands,
         mode=mode,
         proxy=proxy,
-        webdav=webdav,
         config_path=path,
     )

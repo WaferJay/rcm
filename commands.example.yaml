@@ -14,18 +14,6 @@ server:
   #   hostnames: [rcm.internal.example.com]
   # For manually managed certificates, use cert_file and key_file instead.
 
-# Optional WebDAV share on the same port.
-# webdav:
-#   root: /srv/rcm-files
-#   path: /webdav/
-#   read_only: true
-#   hide:
-#     rcm: true
-#     config: true
-#     glob: ["**/*.tmp", "secret/**"]
-#   auth:
-#     type: bearer  # bearer, basic, or none
-
 # Optional auth block. RCM_API_KEY env var takes precedence.
 # auth:
 #   api_key: change-me

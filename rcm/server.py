@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import inspect
 import json
 import os
@@ -13,9 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from fastmcp import FastMCP
-from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.routing import Mount
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 from .auth import ApiKeyAuth
@@ -24,7 +23,6 @@ from .runner import run_command
 from .proxy import ProxyError, ProxyRuntime
 from .store import RUN_ID_RE, Store
 from .tls import TLSConfigError, prepare_tls, uvicorn_tls_config
-from .webdav import WebDAVError, build_webdav_app
 
 PY_TYPES: dict[str, type] = {
     "string": str,
@@ -167,9 +165,10 @@ def _register_download_routes(mcp: FastMCP, store: Store) -> None:
         return PlainTextResponse("ok")
 
 
-def build_server(cfg: Config, store: Store, api_key: str) -> FastMCP:
+def build_server(cfg: Config, store: Store, api_key: str | None) -> FastMCP:
     mcp: FastMCP = FastMCP("rcm")
-    mcp.add_middleware(ApiKeyAuth(api_key))
+    if api_key is not None:
+        mcp.add_middleware(ApiKeyAuth(api_key))
     for spec in cfg.commands:
         fn = _build_tool_fn(spec, cfg.defaults.timeout, cfg.defaults.cwd, store)
         mcp.tool(fn)
@@ -178,29 +177,17 @@ def build_server(cfg: Config, store: Store, api_key: str) -> FastMCP:
 
 
 async def build_proxy_server(
-    cfg: Config, store: Store, api_key: str
+    cfg: Config, store: Store, api_key: str | None
 ) -> tuple[FastMCP, ProxyRuntime]:
     """Build a proxy server after discovering all configured remote tools."""
-    runtime = await ProxyRuntime.create(cfg, api_key)
+    runtime = await ProxyRuntime.create(cfg, api_key, store)
     _register_download_routes(runtime.server, store)
     return runtime.server, runtime
 
 
-def build_http_app(mcp: FastMCP, cfg: Config, api_key: str) -> Starlette:
-    """Build the HTTP application, optionally mounting the WebDAV service."""
-    if cfg.webdav is None:
-        return mcp.http_app()
-
-    webdav_app = build_webdav_app(cfg.webdav, api_key, cfg.config_path)
-    mcp_app = mcp.http_app()
-    webdav_mount = cfg.webdav.path.rstrip("/")
-    return Starlette(
-        routes=[
-            Mount(webdav_mount, app=webdav_app),
-            Mount("/", app=mcp_app),
-        ],
-        lifespan=mcp_app.lifespan,
-    )
+def build_http_app(mcp: FastMCP, cfg: Config, api_key: str) -> Any:
+    """Build the HTTP MCP application."""
+    return mcp.http_app()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -244,6 +231,15 @@ def _effective_tls_config(config: TLSConfig) -> TLSConfig:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the rcm MCP server")
+    parser.add_argument(
+        "--stdio",
+        action="store_true",
+        help="serve MCP over stdin/stdout instead of Streamable HTTP",
+    )
+    args = parser.parse_args()
+    stdio = args.stdio
+
     cfg_path = os.environ.get("RCM_CONFIG", "commands.yaml")
     try:
         cfg = load_config(cfg_path)
@@ -251,34 +247,43 @@ def main() -> None:
         sys.exit(f"rcm: failed to load config {cfg_path}: {e}")
 
     api_key = os.environ.get("RCM_API_KEY") or cfg.auth.api_key
-    if not api_key:
+    if not stdio and not api_key:
         sys.exit(
             "rcm: RCM_API_KEY is required (set the env var or auth.api_key in config)"
         )
 
+    runs_dir = Path(os.environ.get("RCM_RUNS_DIR", "./runs")).resolve()
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
     public_base_url = os.environ.get("RCM_PUBLIC_BASE_URL") or cfg.server.public_base_url
-    if not public_base_url:
+    if not stdio and not public_base_url:
         sys.exit(
             "rcm: public base URL is required "
             "(set RCM_PUBLIC_BASE_URL or server.public_base_url)"
         )
+    if stdio:
+        public_base_url = public_base_url or runs_dir.as_uri()
 
-    try:
-        tls_config = _effective_tls_config(cfg.server.tls)
-        if (
-            tls_config.enabled
-            and urlsplit(public_base_url).scheme.lower() != "https"
-        ):
-            raise TLSConfigError(
-                "server.public_base_url must use https when TLS is enabled"
-            )
-        tls_files = prepare_tls(cfg_path, tls_config, public_base_url)
-    except (TLSConfigError, ValueError) as e:
-        sys.exit(f"rcm: failed to configure TLS: {e}")
+    tls_files = None
+    if not stdio:
+        try:
+            tls_config = _effective_tls_config(cfg.server.tls)
+            if (
+                tls_config.enabled
+                and urlsplit(public_base_url).scheme.lower() != "https"
+            ):
+                raise TLSConfigError(
+                    "server.public_base_url must use https when TLS is enabled"
+                )
+            tls_files = prepare_tls(cfg_path, tls_config, public_base_url)
+        except (TLSConfigError, ValueError) as e:
+            sys.exit(f"rcm: failed to configure TLS: {e}")
 
-    runs_dir = Path(os.environ.get("RCM_RUNS_DIR", "./runs")).resolve()
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    store = Store(runs_dir, public_base_url=public_base_url)
+    store = Store(
+        runs_dir,
+        public_base_url=public_base_url,
+        local_urls=stdio,
+    )
 
     retention_raw = os.environ.get("RCM_RUNS_RETENTION", "0")
     try:
@@ -287,6 +292,26 @@ def main() -> None:
         retention = 0
     if retention > 0:
         store.prune(retention)
+
+    if stdio:
+        if cfg.mode == "server":
+            build_server(cfg, store, api_key=None).run(transport="stdio")
+            return
+
+        async def serve_proxy_stdio() -> None:
+            runtime: ProxyRuntime | None = None
+            try:
+                mcp, runtime = await build_proxy_server(cfg, store, api_key=None)
+                await mcp.run_async(transport="stdio")
+            finally:
+                if runtime is not None:
+                    await runtime.close()
+
+        try:
+            asyncio.run(serve_proxy_stdio())
+        except ProxyError as e:
+            sys.exit(f"rcm: failed to configure proxy: {e}")
+        return
 
     host = os.environ.get("RCM_HOST") or cfg.server.host or "0.0.0.0"
     port = int(os.environ.get("RCM_PORT") or cfg.server.port or 8000)
@@ -301,27 +326,12 @@ def main() -> None:
             f"on {scheme}://{host}:{port}/mcp/  (public base: {public_base_url})",
             file=sys.stderr,
         )
-        if cfg.webdav is None:
-            mcp.run(
-                transport="http",
-                host=host,
-                port=port,
-                uvicorn_config=uvicorn_config,
-            )
-            return
-
-        try:
-            app = build_http_app(mcp, cfg, api_key)
-        except WebDAVError as e:
-            sys.exit(f"rcm: failed to configure WebDAV: {e}")
-
-        print(
-            f"rcm: WebDAV available at {scheme}://{host}:{port}{cfg.webdav.path}",
-            file=sys.stderr,
+        mcp.run(
+            transport="http",
+            host=host,
+            port=port,
+            uvicorn_config=uvicorn_config,
         )
-        import uvicorn
-
-        uvicorn.run(app, host=host, port=port, **uvicorn_config)
         return
 
     print(
@@ -352,5 +362,5 @@ def main() -> None:
 
     try:
         asyncio.run(serve_proxy())
-    except (ProxyError, WebDAVError) as e:
+    except ProxyError as e:
         sys.exit(f"rcm: failed to configure proxy: {e}")

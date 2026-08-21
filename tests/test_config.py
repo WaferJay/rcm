@@ -247,43 +247,6 @@ def test_missing_file(tmp_path: Path) -> None:
     assert "not found" in str(exc.value)
 
 
-def test_load_webdav_config(tmp_path: Path) -> None:
-    cfg = load_config(
-        write(
-            tmp_path,
-            """
-            server: {public_base_url: http://x}
-            webdav:
-              root: /srv/files
-              path: files
-              read_only: false
-              hide:
-                rcm: false
-                config: false
-                glob: ["**/*.tmp", "secret/**"]
-              auth:
-                type: basic
-                username: alice
-                password: secret
-            commands:
-              - name: hello
-                description: Say hello.
-                command: ["echo", "hi"]
-            """,
-        )
-    )
-    assert cfg.webdav is not None
-    assert cfg.webdav.root == "/srv/files"
-    assert cfg.webdav.path == "/files/"
-    assert cfg.webdav.read_only is False
-    assert cfg.webdav.auth.type == "basic"
-    assert cfg.webdav.auth.username == "alice"
-    assert cfg.webdav.hide.rcm is False
-    assert cfg.webdav.hide.config is False
-    assert cfg.webdav.hide.glob == ["**/*.tmp", "secret/**"]
-    assert cfg.config_path == (tmp_path / "commands.yaml").resolve()
-
-
 def test_load_proxy_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REMOTE_MCP_AUTH", "Bearer env-token")
     cfg = load_config(
@@ -325,38 +288,14 @@ def test_load_proxy_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert http_target.headers["X-Project"].value == "compile"
 
 
-@pytest.mark.parametrize(
-    "webdav, fragment",
-    [
-        ("null", "must be a mapping"),
-        ("{root: /tmp, path: /}", "must not be `/`"),
-        ("{root: /tmp, path: /mcp/files}", "conflicts with a reserved path"),
-        ("{root: /tmp, read_only: 1}", "must be a boolean"),
-        ("{root: /tmp, hide: {rcm: 1}}", "webdav.hide.rcm must be a boolean"),
-        ("{root: /tmp, hide: {config: 1}}", "webdav.hide.config must be a boolean"),
-        ("{root: /tmp, hide: {glob: '*.tmp'}}", "webdav.hide.glob must be a list"),
-        (
-            "{root: /tmp, hide: {glob: ['../secret']}}",
-            "must not contain empty, `.` or `..` path parts",
-        ),
-        (
-            "{root: /tmp, hide: {glob: ['[abc']}}",
-            "has an invalid character class",
-        ),
-        ("{root: /tmp, auth: {type: unknown}}", "must be one of"),
-        ("{root: /tmp, auth: {type: basic}}", "are required for basic auth"),
-    ],
-)
-def test_invalid_webdav_configs_rejected(
-    tmp_path: Path, webdav: str, fragment: str
-) -> None:
+def test_webdav_config_rejected(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as exc:
         load_config(
             write(
                 tmp_path,
-                f"""
-                server: {{public_base_url: http://x}}
-                webdav: {webdav}
+                """
+                server: {public_base_url: http://x}
+                webdav: {root: /tmp}
                 commands:
                   - name: hello
                     description: Say hello.
@@ -364,7 +303,7 @@ def test_invalid_webdav_configs_rejected(
                 """,
             )
         )
-    assert fragment in str(exc.value)
+    assert "webdav" in str(exc.value)
 
 
 @pytest.mark.parametrize(

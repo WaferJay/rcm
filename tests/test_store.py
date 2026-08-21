@@ -33,6 +33,12 @@ def test_url_for_each_stream(tmp_path: Path) -> None:
     assert s.url_for("a", "meta").endswith("/runs/a/meta")
 
 
+def test_local_url_for_uses_absolute_file_uri(tmp_path: Path) -> None:
+    s = Store(tmp_path, public_base_url=tmp_path.as_uri(), local_urls=True)
+    rid, _ = s.create_run()
+    assert s.url_for(rid, "stdout") == s.file_path(rid, "stdout").resolve().as_uri()
+
+
 def test_create_run_makes_directory(tmp_path: Path) -> None:
     s = Store(tmp_path, public_base_url="http://x")
     rid, d = s.create_run()
