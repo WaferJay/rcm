@@ -68,6 +68,7 @@ uv run pytest
 server:
   host: 0.0.0.0
   port: 8000
+  transport: http   # http (default) or stdio
   public_base_url: https://rcm.example.com
   # Optional native HTTPS; omit this block for HTTP.
   tls:
@@ -122,6 +123,15 @@ proxy:
         - '**/*.pyc'
       delete: false
 
+  # Read the remote config over SSH. The remote server.transport decides how
+  # this target is connected; no transport or remote command is repeated here.
+  remote_compile:
+    ssh:
+      host: compile-machine
+    config: /etc/rcm/commands.yaml
+    sync:
+      enabled: true
+
   local_tools:
     transport: stdio
     command: [uv, run, my-local-mcp]
@@ -142,12 +152,25 @@ Supported transports are `stdio` (local command), `ssh` (remote command),
 `env` or `value`; an environment variable that is missing or empty is an
 error, while `value` permits a directly configured header value.
 
+The server's own transport is selected explicitly with `server.transport`.
+It defaults to `http` for compatibility with existing configurations. A
+proxy target can instead use `ssh` plus an absolute remote `config` path. rcm
+reads that file over SSH and inspects its `server.transport`: for `http`, it
+connects directly to the remote `server.public_base_url` and does not start a
+remote rcm process; for `stdio`, it starts `rcm --stdio`, falling back to
+`uvx rcm --stdio` when `rcm` is not on the remote PATH. HTTP connection errors
+are returned as errors and do not fall back to stdio.
+
 Every proxied tool is exposed as `<target>__<tool>`, for example
 `compile__build`. Current rcm command tools have no additional name prefix.
 
-If `sync` is configured, rcm runs one-way `rsync` from `source` to
-`destination` immediately before every `tools/call`. A failed sync blocks the
-remote call. `excludes` are relative POSIX globs and support `*`, `?`,
+If `sync` is configured and `enabled` is not set to `false`, rcm runs one-way
+`rsync` from `source` to `destination` immediately before every `tools/call`.
+`enabled` defaults to `true`; `sync: {enabled: false}` disables it. For a
+remote-config target, omitted `source` defaults to the local working
+directory, and omitted `destination` defaults to the remote `defaults.cwd`
+or the directory containing the remote config. Explicit values override these
+defaults. A failed sync blocks the remote call. `excludes` are relative POSIX globs and support `*`, `?`,
 character classes, and recursive `**`. The file loaded through `RCM_CONFIG` is
 automatically excluded whenever it is inside the configured source directory.
 `delete` defaults to `false` and must be explicitly enabled to remove files

@@ -31,6 +31,8 @@ class SyncRunner:
         self._lock = asyncio.Lock()
 
     def _source_path(self) -> Path:
+        if self.spec.source is None:
+            raise SyncError(f"sync source is not configured for target {self.target.name!r}")
         source = Path(self.spec.source).expanduser().resolve()
         if not source.exists():
             raise SyncError(f"sync source does not exist: {source}")
@@ -41,8 +43,12 @@ class SyncRunner:
         return source
 
     def _destination(self) -> str:
+        if self.spec.destination is None:
+            raise SyncError(
+                f"sync destination is not configured for target {self.target.name!r}"
+            )
         destination = self.spec.destination.rstrip("/") or "/"
-        if self.target.transport == "ssh" and self.target.ssh is not None:
+        if self.target.ssh is not None:
             # Permit an explicit rsync host in the destination, otherwise use
             # the SSH target's configured host and keep the YAML concise.
             if ":" not in destination.split("/", 1)[0]:

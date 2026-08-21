@@ -168,6 +168,8 @@ async def test_stdio_server_returns_local_file_urls(tmp_path: Path) -> None:
     config_path = tmp_path / "commands.yaml"
     config_path.write_text(
         """
+        server:
+          transport: stdio
         commands:
           - name: binary_output
             description: Write binary output.
@@ -188,7 +190,7 @@ async def test_stdio_server_returns_local_file_urls(tmp_path: Path) -> None:
     client = Client(
         StdioTransport(
             command=sys.executable,
-            args=["-m", "rcm", "--stdio"],
+            args=["-m", "rcm"],
             cwd=str(Path.cwd()),
             env=env,
         )

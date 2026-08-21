@@ -2,6 +2,7 @@
 server:
   host: 0.0.0.0
   port: 8000
+  transport: http
   # Public base URL clients use to reach this server.
   # Required (here or via RCM_PUBLIC_BASE_URL).
   public_base_url: https://rcm.example.com
@@ -24,6 +25,13 @@ server:
 # mode: proxy
 # commands: []
 # proxy:
+#   # Remote-config targets discover the transport from the remote YAML.
+#   remote_compile:
+#     ssh:
+#       host: compile-machine
+#     config: /etc/rcm/commands.yaml
+#     sync:
+#       enabled: true
 #   compile:
 #     transport: ssh
 #     ssh:

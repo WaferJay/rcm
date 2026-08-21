@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import os
+import shlex
 import shutil
 from contextlib import AsyncExitStack
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+
+import yaml
 
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import (
@@ -21,13 +28,211 @@ from pydantic import PrivateAttr
 
 from .auth import ApiKeyAuth
 from .artifacts import ARTIFACT_ENV, ARTIFACT_ENV_VALUE, ARTIFACT_PROTOCOL
-from .config import Config, ProxyTargetSpec
+from .config import (
+    Config,
+    HeaderSpec,
+    ProxyTargetSpec,
+    RemoteConfigSpec,
+    SyncSpec,
+)
 from .store import Store
 from .sync import SyncError, SyncRunner
 
 
 class ProxyError(RuntimeError):
     """Raised when a proxy target cannot be prepared."""
+
+
+@dataclass(frozen=True)
+class RemoteServerMetadata:
+    transport: str
+    public_base_url: str | None = None
+    api_key: str | None = None
+    cwd: str | None = None
+
+
+async def _ssh_command(host: str, command: str) -> tuple[int, str, str]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ssh",
+            host,
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise ProxyError(f"failed to execute ssh for remote host {host!r}: {exc}") from exc
+    stdout, stderr = await proc.communicate()
+    return (
+        proc.returncode,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+    )
+
+
+async def _read_remote_metadata(target: ProxyTargetSpec) -> RemoteServerMetadata:
+    if target.ssh is None or target.remote_config is None:
+        raise ProxyError(f"proxy target {target.name!r} is missing remote SSH config")
+    path = target.remote_config.path
+    returncode, stdout, stderr = await _ssh_command(
+        target.ssh.host,
+        f"cat -- {shlex.quote(path)}",
+    )
+    if returncode != 0:
+        detail = stderr.strip() or stdout.strip()
+        suffix = f": {detail}" if detail else ""
+        raise ProxyError(
+            f"failed to read remote config {path!r} on host {target.ssh.host!r}"
+            f" (exit code {returncode}){suffix}"
+        )
+
+    try:
+        raw = yaml.safe_load(stdout)
+    except yaml.YAMLError as exc:
+        raise ProxyError(f"invalid YAML in remote config {path!r}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ProxyError(f"remote config {path!r} must contain a mapping")
+
+    server_raw = raw.get("server") or {}
+    if not isinstance(server_raw, dict):
+        raise ProxyError(f"remote config {path!r}: server must be a mapping")
+    transport = server_raw.get("transport", "http")
+    if not isinstance(transport, str) or transport not in {"http", "stdio"}:
+        raise ProxyError(
+            f"remote config {path!r}: server.transport must be `http` or `stdio`, "
+            f"got {transport!r}"
+        )
+
+    public_base_url = server_raw.get("public_base_url")
+    if public_base_url is not None and (
+        not isinstance(public_base_url, str) or not public_base_url.strip()
+    ):
+        raise ProxyError(
+            f"remote config {path!r}: server.public_base_url must be a non-empty string"
+        )
+    if isinstance(public_base_url, str):
+        public_base_url = public_base_url.strip()
+        parsed = urlsplit(public_base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ProxyError(
+                f"remote config {path!r}: server.public_base_url must be an http:// or https:// URL"
+            )
+
+    auth_raw = raw.get("auth") or {}
+    if not isinstance(auth_raw, dict):
+        raise ProxyError(f"remote config {path!r}: auth must be a mapping")
+    api_key = auth_raw.get("api_key")
+    if api_key is not None and (
+        not isinstance(api_key, str) or not api_key.strip()
+    ):
+        raise ProxyError(
+            f"remote config {path!r}: auth.api_key must be a non-empty string"
+        )
+    if isinstance(api_key, str):
+        api_key = api_key.strip()
+
+    defaults_raw = raw.get("defaults") or {}
+    if not isinstance(defaults_raw, dict):
+        raise ProxyError(f"remote config {path!r}: defaults must be a mapping")
+    cwd = defaults_raw.get("cwd")
+    if cwd is not None and (not isinstance(cwd, str) or not cwd.strip()):
+        raise ProxyError(
+            f"remote config {path!r}: defaults.cwd must be a non-empty string"
+        )
+    if isinstance(cwd, str):
+        cwd = cwd.strip()
+
+    return RemoteServerMetadata(
+        transport=transport,
+        public_base_url=public_base_url,
+        api_key=api_key,
+        cwd=cwd,
+    )
+
+
+async def _discover_remote_stdio_command(host: str) -> list[str]:
+    rcm_returncode, rcm_stdout, rcm_stderr = await _ssh_command(
+        host,
+        "command -v rcm",
+    )
+    rcm_path = rcm_stdout.strip().splitlines()[0] if rcm_returncode == 0 else ""
+    if rcm_path:
+        return [rcm_path, "--stdio"]
+
+    uvx_returncode, uvx_stdout, uvx_stderr = await _ssh_command(
+        host,
+        "command -v uvx",
+    )
+    uvx_path = uvx_stdout.strip().splitlines()[0] if uvx_returncode == 0 else ""
+    if uvx_path:
+        return [uvx_path, "rcm", "--stdio"]
+
+    detail = uvx_stderr.strip() or rcm_stderr.strip()
+    suffix = f": {detail}" if detail else ""
+    raise ProxyError(
+        f"neither rcm nor uvx was found on remote host {host!r}{suffix}"
+    )
+
+
+def _remote_http_endpoint(public_base_url: str) -> str:
+    endpoint = public_base_url.rstrip("/")
+    return endpoint if endpoint.endswith("/mcp") else f"{endpoint}/mcp"
+
+
+def _remote_sync_spec(
+    target: ProxyTargetSpec,
+    remote_config: RemoteConfigSpec,
+    metadata: RemoteServerMetadata,
+) -> SyncSpec | None:
+    configured = target.sync
+    if configured is not None and not configured.enabled:
+        return None
+
+    source = str(Path.cwd())
+    destination = metadata.cwd or str(Path(remote_config.path).parent)
+    if configured is None:
+        return SyncSpec(source=source, destination=destination)
+    return replace(
+        configured,
+        source=configured.source or source,
+        destination=configured.destination or destination,
+        enabled=True,
+    )
+
+
+async def _resolve_remote_target(target: ProxyTargetSpec) -> ProxyTargetSpec:
+    if target.remote_config is None or target.ssh is None:
+        raise ProxyError(f"proxy target {target.name!r} is missing remote config or SSH")
+
+    metadata = await _read_remote_metadata(target)
+    sync = _remote_sync_spec(target, target.remote_config, metadata)
+    if metadata.transport == "http":
+        if metadata.public_base_url is None:
+            raise ProxyError(
+                f"remote config {target.remote_config.path!r}: "
+                "server.public_base_url is required for HTTP transport"
+            )
+        headers = dict(target.headers)
+        if metadata.api_key is not None and not any(
+            name.lower() == "authorization" for name in headers
+        ):
+            headers["Authorization"] = HeaderSpec(value=f"Bearer {metadata.api_key}")
+        return replace(
+            target,
+            transport="http",
+            endpoint=_remote_http_endpoint(metadata.public_base_url),
+            headers=headers,
+            sync=sync,
+            remote_config=None,
+        )
+
+    command = await _discover_remote_stdio_command(target.ssh.host)
+    return replace(
+        target,
+        transport="ssh",
+        ssh=replace(target.ssh, command=command),
+        sync=sync,
+    )
 
 
 def _resolve_headers(
@@ -74,12 +279,17 @@ def _build_transport(target: ProxyTargetSpec):
 
     if target.transport == "ssh":
         assert target.ssh is not None
+        if target.ssh.command is None:
+            raise ProxyError(f"proxy target {target.name!r} has no SSH command")
+        env_args = [f"{ARTIFACT_ENV}={ARTIFACT_ENV_VALUE}"]
+        if target.remote_config is not None:
+            env_args.append(f"RCM_CONFIG={shlex.quote(target.remote_config.path)}")
         return StdioTransport(
             command="ssh",
             args=[
                 target.ssh.host,
                 "env",
-                f"{ARTIFACT_ENV}={ARTIFACT_ENV_VALUE}",
+                *env_args,
                 *target.ssh.command,
             ],
         )
@@ -237,7 +447,12 @@ class ProxyRuntime:
             server.add_middleware(ApiKeyAuth(api_key))
         stack = AsyncExitStack()
         try:
-            for target in cfg.proxy.targets:
+            for configured_target in cfg.proxy.targets:
+                target = (
+                    await _resolve_remote_target(configured_target)
+                    if configured_target.remote_config is not None
+                    else configured_target
+                )
                 client = await stack.enter_async_context(
                     Client(
                         _build_transport(target),
@@ -247,7 +462,7 @@ class ProxyRuntime:
                 remote_tools = await client.list_tools()
                 sync_runner = (
                     SyncRunner(target, cfg.config_path)
-                    if target.sync is not None
+                    if target.sync is not None and target.sync.enabled
                     else None
                 )
                 for remote_tool in remote_tools:

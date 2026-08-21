@@ -238,13 +238,14 @@ def main() -> None:
         help="serve MCP over stdin/stdout instead of Streamable HTTP",
     )
     args = parser.parse_args()
-    stdio = args.stdio
 
     cfg_path = os.environ.get("RCM_CONFIG", "commands.yaml")
     try:
         cfg = load_config(cfg_path)
     except Exception as e:
         sys.exit(f"rcm: failed to load config {cfg_path}: {e}")
+
+    stdio = args.stdio or cfg.server.transport == "stdio"
 
     api_key = os.environ.get("RCM_API_KEY") or cfg.auth.api_key
     if not stdio and not api_key:

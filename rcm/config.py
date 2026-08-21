@@ -14,6 +14,7 @@ NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 PARAM_TYPES = {"string", "integer", "number", "boolean"}
 MODES = {"server", "proxy"}
 PROXY_TRANSPORTS = {"stdio", "ssh", "http", "sse"}
+SERVER_TRANSPORTS = {"http", "stdio"}
 
 
 class ConfigError(ValueError):
@@ -56,6 +57,7 @@ class ServerSpec:
     port: int | None = None
     public_base_url: str | None = None
     tls: TLSConfig = field(default_factory=TLSConfig)
+    transport: str = "http"
 
 
 @dataclass
@@ -77,16 +79,22 @@ class HeaderSpec:
 
 @dataclass
 class SyncSpec:
-    source: str
-    destination: str
+    source: str | None = None
+    destination: str | None = None
     excludes: list[str] = field(default_factory=list)
     delete: bool = False
+    enabled: bool = True
 
 
 @dataclass
 class SSHSpec:
     host: str
-    command: list[str]
+    command: list[str] | None = None
+
+
+@dataclass
+class RemoteConfigSpec:
+    path: str
 
 
 @dataclass
@@ -99,6 +107,7 @@ class ProxyTargetSpec:
     endpoint: str | None = None
     headers: dict[str, HeaderSpec] = field(default_factory=dict)
     sync: SyncSpec | None = None
+    remote_config: RemoteConfigSpec | None = None
 
 
 @dataclass
@@ -300,10 +309,12 @@ def _parse_sync(raw: Any, target_name: str) -> SyncSpec | None:
         raise ConfigError(f"proxy.{target_name}.sync must be a mapping")
 
     source = raw.get("source")
-    if not isinstance(source, str) or not source.strip():
+    if source is not None and (not isinstance(source, str) or not source.strip()):
         raise ConfigError(f"proxy.{target_name}.sync.source must be a non-empty string")
     destination = raw.get("destination")
-    if not isinstance(destination, str) or not destination.strip():
+    if destination is not None and (
+        not isinstance(destination, str) or not destination.strip()
+    ):
         raise ConfigError(
             f"proxy.{target_name}.sync.destination must be a non-empty string"
         )
@@ -315,11 +326,15 @@ def _parse_sync(raw: Any, target_name: str) -> SyncSpec | None:
     delete = raw.get("delete", False)
     if not isinstance(delete, bool):
         raise ConfigError(f"proxy.{target_name}.sync.delete must be a boolean")
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"proxy.{target_name}.sync.enabled must be a boolean")
     return SyncSpec(
-        source=source.strip(),
-        destination=destination.strip(),
+        source=source.strip() if isinstance(source, str) else None,
+        destination=destination.strip() if isinstance(destination, str) else None,
         excludes=excludes,
         delete=delete,
+        enabled=enabled,
     )
 
 
@@ -331,8 +346,25 @@ def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
     if not isinstance(raw, dict):
         raise ConfigError(f"proxy.{name} must be a mapping")
 
+    remote_config: RemoteConfigSpec | None = None
+    remote_config_raw = raw.get("config")
+    if remote_config_raw is not None:
+        if (
+            not isinstance(remote_config_raw, str)
+            or not remote_config_raw.strip()
+            or not remote_config_raw.strip().startswith("/")
+        ):
+            raise ConfigError(
+                f"proxy.{name}.config must be an absolute, non-empty path"
+            )
+        remote_config = RemoteConfigSpec(path=remote_config_raw.strip())
+
     transport = raw.get("transport")
-    if not isinstance(transport, str) or transport not in PROXY_TRANSPORTS:
+    if remote_config is not None:
+        if transport is not None:
+            raise ConfigError(f"proxy.{name} cannot combine config with transport")
+        transport = "remote"
+    elif not isinstance(transport, str) or transport not in PROXY_TRANSPORTS:
         raise ConfigError(
             f"proxy.{name}.transport must be one of {sorted(PROXY_TRANSPORTS)}, got {transport!r}"
         )
@@ -359,7 +391,7 @@ def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
         if not isinstance(host, str) or not host.strip():
             raise ConfigError(f"proxy.{name}.ssh.host must be a non-empty string")
         ssh_command_raw = ssh_raw.get("command")
-        if (
+        if ssh_command_raw is not None and (
             not isinstance(ssh_command_raw, list)
             or not ssh_command_raw
             or any(not isinstance(part, str) or not part for part in ssh_command_raw)
@@ -383,6 +415,8 @@ def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
         raise ConfigError(f"proxy.{name}.command is required for stdio transport")
     if transport == "ssh" and ssh is None:
         raise ConfigError(f"proxy.{name}.ssh is required for ssh transport")
+    if transport == "ssh" and ssh is not None and ssh.command is None:
+        raise ConfigError(f"proxy.{name}.ssh.command is required for ssh transport")
     if transport in {"http", "sse"} and endpoint is None:
         raise ConfigError(f"proxy.{name}.endpoint is required for {transport} transport")
 
@@ -390,14 +424,36 @@ def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
         raise ConfigError(f"proxy.{name}.command is not used with ssh transport")
     if transport in {"http", "sse"} and command is not None:
         raise ConfigError(f"proxy.{name}.command is not used with {transport} transport")
-    if transport != "ssh" and ssh is not None:
+    if transport == "remote" and ssh is None:
+        raise ConfigError(f"proxy.{name}.ssh is required when config is specified")
+    if transport == "remote" and ssh is not None and ssh.command is not None:
+        raise ConfigError(
+            f"proxy.{name}.ssh.command must not be specified when config is specified"
+        )
+    if transport != "ssh" and transport != "remote" and ssh is not None:
         raise ConfigError(f"proxy.{name}.ssh is only valid for ssh transport")
     if transport not in {"http", "sse"} and endpoint is not None:
         raise ConfigError(f"proxy.{name}.endpoint is only valid for http or sse transport")
-    if transport not in {"http", "sse"} and raw.get("headers") is not None:
+    if transport not in {"http", "sse", "remote"} and raw.get("headers") is not None:
         raise ConfigError(f"proxy.{name}.headers is only valid for http or sse transport")
     if transport != "stdio" and cwd is not None:
         raise ConfigError(f"proxy.{name}.cwd is only valid for stdio transport")
+
+    if transport == "remote":
+        if command is not None:
+            raise ConfigError(f"proxy.{name} cannot combine config with command")
+        if endpoint is not None:
+            raise ConfigError(f"proxy.{name} cannot combine config with endpoint")
+        if cwd is not None:
+            raise ConfigError(f"proxy.{name} cannot combine config with cwd")
+
+    sync = _parse_sync(raw.get("sync"), name)
+    if transport != "remote" and sync is not None and sync.enabled and (
+        sync.source is None or sync.destination is None
+    ):
+        raise ConfigError(
+            f"proxy.{name}.sync.source and sync.destination are required for explicit transports"
+        )
 
     return ProxyTargetSpec(
         name=name,
@@ -407,7 +463,8 @@ def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
         ssh=ssh,
         endpoint=endpoint.strip() if isinstance(endpoint, str) else None,
         headers=_parse_headers(raw.get("headers"), name),
-        sync=_parse_sync(raw.get("sync"), name),
+        sync=sync,
+        remote_config=remote_config,
     )
 
 
@@ -497,9 +554,15 @@ def load_config(path: str | Path) -> Config:
     server_raw = raw.get("server") or {}
     if not isinstance(server_raw, dict):
         raise ConfigError("`server` must be a mapping")
+    server_transport = server_raw.get("transport", "http")
+    if not isinstance(server_transport, str) or server_transport not in SERVER_TRANSPORTS:
+        raise ConfigError(
+            f"server.transport must be one of {sorted(SERVER_TRANSPORTS)}, got {server_transport!r}"
+        )
     server = ServerSpec(
         host=server_raw.get("host"),
         port=int(server_raw["port"]) if server_raw.get("port") is not None else None,
+        transport=server_transport,
         public_base_url=server_raw.get("public_base_url"),
         tls=_parse_tls(server_raw.get("tls") or {}),
     )

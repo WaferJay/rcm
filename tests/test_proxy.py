@@ -12,8 +12,24 @@ import pytest
 from fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent
 
-from rcm.config import AuthSpec, Config, DefaultsSpec, ProxySpec, ProxyTargetSpec, ServerSpec
-from rcm.proxy import ProxyTool
+from rcm.config import (
+    AuthSpec,
+    Config,
+    DefaultsSpec,
+    HeaderSpec,
+    ProxySpec,
+    ProxyTargetSpec,
+    RemoteConfigSpec,
+    SSHSpec,
+    ServerSpec,
+)
+from rcm.proxy import (
+    ProxyTool,
+    RemoteServerMetadata,
+    _discover_remote_stdio_command,
+    _read_remote_metadata,
+    _resolve_remote_target,
+)
 from rcm.server import build_proxy_server
 from rcm.store import Store
 from rcm.sync import SyncError
@@ -128,6 +144,150 @@ async def test_proxy_tool_materializes_rcm_inline_artifact(tmp_path) -> None:
     assert "artifact_protocol" not in data
     assert Path(urlparse(data["stdout_url"]).path).read_bytes() == stdout
     assert Path(urlparse(data["stderr_url"]).path).read_bytes() == stderr
+
+
+@pytest.mark.asyncio
+async def test_remote_http_config_resolves_without_stdio_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rcm.proxy as proxy_module
+
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="remote",
+        ssh=SSHSpec(host="compile-machine"),
+        remote_config=RemoteConfigSpec(path="/etc/rcm/commands.yaml"),
+        headers={"X-Local": HeaderSpec(value="local")},
+    )
+
+    async def fake_read(_: ProxyTargetSpec) -> RemoteServerMetadata:
+        return RemoteServerMetadata(
+            transport="http",
+            public_base_url="https://compile.example.com/rcm/",
+            api_key="remote-key",
+            cwd="/srv/project",
+        )
+
+    async def unexpected_discovery(_: str) -> list[str]:
+        raise AssertionError("HTTP remote configs must not discover or start rcm")
+
+    monkeypatch.setattr(proxy_module, "_read_remote_metadata", fake_read)
+    monkeypatch.setattr(
+        proxy_module, "_discover_remote_stdio_command", unexpected_discovery
+    )
+    monkeypatch.chdir(tmp_path)
+
+    resolved = await _resolve_remote_target(target)
+
+    assert resolved.transport == "http"
+    assert resolved.endpoint == "https://compile.example.com/rcm/mcp"
+    assert resolved.remote_config is None
+    assert resolved.ssh is not None and resolved.ssh.command is None
+    assert resolved.headers["Authorization"].value == "Bearer remote-key"
+    assert resolved.headers["X-Local"].value == "local"
+    assert resolved.sync is not None
+    assert resolved.sync.source == str(tmp_path)
+    assert resolved.sync.destination == "/srv/project"
+    assert resolved.sync.excludes == []
+    assert resolved.sync.delete is False
+
+
+@pytest.mark.asyncio
+async def test_remote_config_metadata_uses_explicit_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rcm.proxy as proxy_module
+
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="remote",
+        ssh=SSHSpec(host="compile-machine"),
+        remote_config=RemoteConfigSpec(path="/etc/rcm/commands.yaml"),
+    )
+
+    async def fake_ssh(_: str, command: str) -> tuple[int, str, str]:
+        assert command == "cat -- /etc/rcm/commands.yaml"
+        return (
+            0,
+            """
+            server:
+              transport: http
+              public_base_url: https://compile.example.com
+            auth:
+              api_key: remote-key
+            defaults:
+              cwd: /srv/project
+            """,
+            "",
+        )
+
+    monkeypatch.setattr(proxy_module, "_ssh_command", fake_ssh)
+
+    metadata = await _read_remote_metadata(target)
+
+    assert metadata.transport == "http"
+    assert metadata.public_base_url == "https://compile.example.com"
+    assert metadata.api_key == "remote-key"
+    assert metadata.cwd == "/srv/project"
+
+
+@pytest.mark.asyncio
+async def test_remote_stdio_discovery_falls_back_to_uvx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rcm.proxy as proxy_module
+
+    calls: list[str] = []
+
+    async def fake_ssh(_: str, command: str) -> tuple[int, str, str]:
+        calls.append(command)
+        if command == "command -v rcm":
+            return 1, "", "rcm not found"
+        return 0, "/home/me/.local/bin/uvx\n", ""
+
+    monkeypatch.setattr(proxy_module, "_ssh_command", fake_ssh)
+
+    command = await _discover_remote_stdio_command("compile-machine")
+
+    assert command == ["/home/me/.local/bin/uvx", "rcm", "--stdio"]
+    assert calls == ["command -v rcm", "command -v uvx"]
+
+
+@pytest.mark.asyncio
+async def test_remote_stdio_config_discovers_rcm_and_keeps_remote_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rcm.proxy as proxy_module
+
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="remote",
+        ssh=SSHSpec(host="compile-machine"),
+        remote_config=RemoteConfigSpec(path="/etc/rcm/commands.yaml"),
+    )
+
+    async def fake_read(_: ProxyTargetSpec) -> RemoteServerMetadata:
+        return RemoteServerMetadata(transport="stdio", cwd="/srv/project")
+
+    async def fake_discovery(_: str) -> list[str]:
+        return ["/opt/rcm/bin/rcm", "--stdio"]
+
+    monkeypatch.setattr(proxy_module, "_read_remote_metadata", fake_read)
+    monkeypatch.setattr(
+        proxy_module, "_discover_remote_stdio_command", fake_discovery
+    )
+    monkeypatch.chdir(tmp_path)
+
+    resolved = await _resolve_remote_target(target)
+
+    assert resolved.transport == "ssh"
+    assert resolved.ssh is not None
+    assert resolved.ssh.command == ["/opt/rcm/bin/rcm", "--stdio"]
+    assert resolved.remote_config is not None
+    assert resolved.remote_config.path == "/etc/rcm/commands.yaml"
+    assert resolved.sync is not None
+    assert resolved.sync.source == str(tmp_path)
+    assert resolved.sync.destination == "/srv/project"
 
 
 @pytest.mark.asyncio

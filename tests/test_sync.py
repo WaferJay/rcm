@@ -53,3 +53,18 @@ def test_ssh_sync_destination_uses_target_host(tmp_path: Path) -> None:
     runner = SyncRunner(target)
     command = runner._command(tmp_path)
     assert command[-1] == "compile-machine:/remote/project/"
+
+
+def test_http_remote_config_sync_destination_uses_ssh_host(tmp_path: Path) -> None:
+    from rcm.config import SSHSpec
+
+    target = ProxyTargetSpec(
+        name="remote-http",
+        transport="http",
+        endpoint="https://remote.example.com/mcp",
+        ssh=SSHSpec(host="compile-machine"),
+        sync=SyncSpec(source=str(tmp_path), destination="/remote/project"),
+    )
+    runner = SyncRunner(target)
+    command = runner._command(tmp_path)
+    assert command[-1] == "compile-machine:/remote/project/"

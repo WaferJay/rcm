@@ -35,6 +35,24 @@ def test_load_minimal_config(tmp_path: Path) -> None:
     assert cfg.commands[0].command == ["echo", "hi"]
     assert cfg.commands[0].params == []
     assert cfg.server.tls.enabled is False
+    assert cfg.server.transport == "http"
+
+
+def test_load_stdio_server_transport(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            server:
+              transport: stdio
+            commands:
+              - name: hello
+                description: Say hello.
+                command: ["echo", "hi"]
+            """,
+        )
+    )
+    assert cfg.server.transport == "stdio"
 
 
 def test_load_tls_config(tmp_path: Path) -> None:
@@ -233,6 +251,16 @@ def test_full_command_with_params_and_defaults(tmp_path: Path) -> None:
             """,
             "must be provided together",
         ),
+        (
+            """
+            server: {transport: websocket}
+            commands:
+              - name: a
+                description: x
+                command: ["a"]
+            """,
+            "server.transport must be one of",
+        ),
     ],
 )
 def test_invalid_configs_rejected(tmp_path: Path, body: str, fragment: str) -> None:
@@ -284,8 +312,114 @@ def test_load_proxy_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert compile_target.sync is not None
     assert compile_target.sync.excludes == [".git/**", "**/*.pyc"]
     assert compile_target.sync.delete is False
+    assert compile_target.sync.enabled is True
     assert http_target.headers["Authorization"].env == "REMOTE_MCP_AUTH"
     assert http_target.headers["X-Project"].value == "compile"
+
+
+def test_load_remote_config_proxy_target(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            mode: proxy
+            proxy:
+              compile:
+                ssh:
+                  host: compile-machine
+                config: /etc/rcm/commands.yaml
+                sync:
+                  enabled: false
+            """,
+        )
+    )
+    target = cfg.proxy.targets[0]
+    assert target.transport == "remote"
+    assert target.remote_config is not None
+    assert target.remote_config.path == "/etc/rcm/commands.yaml"
+    assert target.ssh is not None
+    assert target.ssh.command is None
+    assert target.sync is not None
+    assert target.sync.enabled is False
+
+
+@pytest.mark.parametrize(
+    "body, fragment",
+    [
+        (
+            """
+            mode: proxy
+            proxy:
+              target:
+                ssh: {host: compile-machine}
+                config: relative/commands.yaml
+            """,
+            "absolute",
+        ),
+        (
+            """
+            mode: proxy
+            proxy:
+              target:
+                transport: http
+                ssh: {host: compile-machine}
+                config: /etc/rcm/commands.yaml
+            """,
+            "cannot combine config with transport",
+        ),
+        (
+            """
+            mode: proxy
+            proxy:
+              target:
+                ssh:
+                  host: compile-machine
+                  command: [rcm, --stdio]
+                config: /etc/rcm/commands.yaml
+            """,
+            "must not be specified",
+        ),
+        (
+            """
+            mode: proxy
+            proxy:
+              target:
+                config: /etc/rcm/commands.yaml
+            """,
+            "ssh is required",
+        ),
+    ],
+)
+def test_invalid_remote_config_proxy_targets_rejected(
+    tmp_path: Path, body: str, fragment: str
+) -> None:
+    with pytest.raises(ConfigError) as exc:
+        load_config(
+            write(
+                tmp_path,
+                "server: {public_base_url: http://x}\n" + textwrap.dedent(body),
+            )
+        )
+    assert fragment in str(exc.value)
+
+
+def test_sync_enabled_false_is_parsed(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            mode: proxy
+            proxy:
+              local:
+                transport: stdio
+                command: [echo]
+                sync:
+                  enabled: false
+            """,
+        )
+    )
+    assert cfg.proxy.targets[0].sync is not None
+    assert cfg.proxy.targets[0].sync.enabled is False
 
 
 def test_webdav_config_rejected(tmp_path: Path) -> None:
