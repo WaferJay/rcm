@@ -14,6 +14,7 @@ from mcp.types import CallToolResult, TextContent
 
 from rcm.config import (
     AuthSpec,
+    CommandSpec,
     Config,
     DefaultsSpec,
     HeaderSpec,
@@ -309,8 +310,13 @@ mcp.run()
         server=ServerSpec(public_base_url="http://testserver"),
         auth=AuthSpec(api_key=None),
         defaults=DefaultsSpec(),
-        commands=[],
-        mode="proxy",
+        commands=[
+            CommandSpec(
+                name="local_echo",
+                description="Echo locally.",
+                command=[sys.executable, "-c", "print('local')"],
+            )
+        ],
         proxy=ProxySpec(
             targets=[
                 ProxyTargetSpec(
@@ -328,11 +334,15 @@ mcp.run()
     )
     try:
         tools = await mcp._list_tools()
-        assert [tool.name for tool in tools] == ["compile__remote_echo"]
+        assert {tool.name for tool in tools} == {"local_echo", "compile__remote_echo"}
         tool = await mcp.get_tool("compile__remote_echo")
         assert tool is not None
         result = await tool.run({"value": "ok"})
         assert result.content[0].text == "ok"
+        local_tool = await mcp.get_tool("local_echo")
+        assert local_tool is not None
+        local_result = await local_tool.run({})
+        assert local_result.structured_content["stdout_bytes"] > 0
     finally:
         await runtime.close()
 
@@ -363,7 +373,6 @@ async def test_proxy_runtime_recovers_remote_rcm_artifact(
         auth=AuthSpec(api_key=None),
         defaults=DefaultsSpec(),
         commands=[],
-        mode="proxy",
         proxy=ProxySpec(
             targets=[
                 ProxyTargetSpec(
@@ -426,7 +435,6 @@ async def test_proxy_runtime_bridges_streamable_http(tmp_path) -> None:
         auth=AuthSpec(api_key=None),
         defaults=DefaultsSpec(),
         commands=[],
-        mode="proxy",
         proxy=ProxySpec(
             targets=[
                 ProxyTargetSpec(

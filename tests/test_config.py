@@ -115,8 +115,8 @@ def test_full_command_with_params_and_defaults(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "body, fragment",
     [
-        # missing commands
-        ("server: {public_base_url: x}\n", "must be a non-empty list"),
+        # missing commands and proxy
+        ("server: {public_base_url: x}\n", "at least one of `commands` or `proxy`"),
         # string command form
         (
             """
@@ -281,7 +281,6 @@ def test_load_proxy_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
         write(
             tmp_path,
             """
-            mode: proxy
             proxy:
               compile:
                 transport: ssh
@@ -303,7 +302,6 @@ def test_load_proxy_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
         )
     )
 
-    assert cfg.mode == "proxy"
     assert cfg.commands == []
     assert cfg.proxy is not None
     compile_target, http_target = cfg.proxy.targets
@@ -317,12 +315,49 @@ def test_load_proxy_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert http_target.headers["X-Project"].value == "compile"
 
 
+def test_load_commands_and_proxy_together(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            commands:
+              - name: local_echo
+                description: Echo locally.
+                command: [echo, local]
+            proxy:
+              remote:
+                transport: http
+                endpoint: https://example.com/mcp
+            """,
+        )
+    )
+    assert [command.name for command in cfg.commands] == ["local_echo"]
+    assert cfg.proxy is not None
+    assert [target.name for target in cfg.proxy.targets] == ["remote"]
+
+
+def test_mode_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="mode.*no longer supported"):
+        load_config(
+            write(
+                tmp_path,
+                """
+                mode: proxy
+                commands: []
+                proxy:
+                  remote:
+                    transport: http
+                    endpoint: https://example.com/mcp
+                """,
+            )
+        )
+
+
 def test_load_remote_config_proxy_target(tmp_path: Path) -> None:
     cfg = load_config(
         write(
             tmp_path,
             """
-            mode: proxy
             proxy:
               compile:
                 ssh:
@@ -348,7 +383,6 @@ def test_load_remote_config_proxy_target(tmp_path: Path) -> None:
     [
         (
             """
-            mode: proxy
             proxy:
               target:
                 ssh: {host: compile-machine}
@@ -358,7 +392,6 @@ def test_load_remote_config_proxy_target(tmp_path: Path) -> None:
         ),
         (
             """
-            mode: proxy
             proxy:
               target:
                 transport: http
@@ -369,7 +402,6 @@ def test_load_remote_config_proxy_target(tmp_path: Path) -> None:
         ),
         (
             """
-            mode: proxy
             proxy:
               target:
                 ssh:
@@ -381,12 +413,19 @@ def test_load_remote_config_proxy_target(tmp_path: Path) -> None:
         ),
         (
             """
-            mode: proxy
             proxy:
               target:
                 config: /etc/rcm/commands.yaml
             """,
             "ssh is required",
+        ),
+        (
+            """
+            proxy:
+              sync:
+                enabled: true
+            """,
+            "proxy.sync` is not a top-level setting",
         ),
     ],
 )
@@ -408,7 +447,6 @@ def test_sync_enabled_false_is_parsed(tmp_path: Path) -> None:
         write(
             tmp_path,
             """
-            mode: proxy
             proxy:
               local:
                 transport: stdio
@@ -445,14 +483,12 @@ def test_webdav_config_rejected(tmp_path: Path) -> None:
     [
         (
             """
-            mode: proxy
             commands: []
             """,
-            "`proxy` is required",
+            "at least one of `commands` or `proxy`",
         ),
         (
             """
-            mode: proxy
             commands: []
             proxy:
               target:
@@ -465,7 +501,6 @@ def test_webdav_config_rejected(tmp_path: Path) -> None:
         ),
         (
             """
-            mode: proxy
             commands: []
             proxy:
               target:
@@ -480,7 +515,6 @@ def test_webdav_config_rejected(tmp_path: Path) -> None:
         ),
         (
             """
-            mode: proxy
             commands: []
             proxy:
               target:

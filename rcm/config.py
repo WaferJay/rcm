@@ -12,7 +12,6 @@ import yaml
 
 NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 PARAM_TYPES = {"string", "integer", "number", "boolean"}
-MODES = {"server", "proxy"}
 PROXY_TRANSPORTS = {"stdio", "ssh", "http", "sse"}
 SERVER_TRANSPORTS = {"http", "stdio"}
 
@@ -121,7 +120,6 @@ class Config:
     auth: AuthSpec
     defaults: DefaultsSpec
     commands: list[CommandSpec]
-    mode: str = "server"
     proxy: ProxySpec | None = None
     config_path: Path | None = None
 
@@ -477,6 +475,14 @@ def _parse_proxy(raw: Any) -> ProxySpec:
         if name in names:
             raise ConfigError(f"duplicate proxy target name: {name!r}")
         names.add(name)
+        if name == "sync" and isinstance(target_raw, dict) and any(
+            key in target_raw
+            for key in {"enabled", "source", "destination", "excludes", "delete"}
+        ):
+            raise ConfigError(
+                "`proxy.sync` is not a top-level setting; put it under a proxy "
+                "target, for example `proxy.<target>.sync`"
+            )
         targets.append(_parse_proxy_target(name, target_raw))
     return ProxySpec(targets=targets)
 
@@ -547,9 +553,10 @@ def load_config(path: str | Path) -> Config:
     if "webdav" in raw:
         raise ConfigError("`webdav` is no longer supported")
 
-    mode = raw.get("mode", "server")
-    if not isinstance(mode, str) or mode not in MODES:
-        raise ConfigError(f"`mode` must be one of {sorted(MODES)}, got {mode!r}")
+    if "mode" in raw:
+        raise ConfigError(
+            "`mode` is no longer supported; configure `commands` and/or `proxy`"
+        )
 
     server_raw = raw.get("server") or {}
     if not isinstance(server_raw, dict):
@@ -583,8 +590,8 @@ def load_config(path: str | Path) -> Config:
     )
 
     commands_raw = raw.get("commands", [])
-    if not isinstance(commands_raw, list) or (mode == "server" and not commands_raw):
-        raise ConfigError("`commands` must be a non-empty list")
+    if not isinstance(commands_raw, list):
+        raise ConfigError("`commands` must be a list")
     commands = [_parse_command(c) for c in commands_raw]
 
     seen: set[str] = set()
@@ -594,17 +601,14 @@ def load_config(path: str | Path) -> Config:
         seen.add(cmd.name)
 
     proxy = _parse_proxy(raw["proxy"]) if "proxy" in raw else None
-    if mode == "proxy" and proxy is None:
-        raise ConfigError("`proxy` is required when mode is `proxy`")
-    if mode == "server" and proxy is not None:
-        raise ConfigError("`proxy` is only valid when mode is `proxy`")
+    if not commands and proxy is None:
+        raise ConfigError("at least one of `commands` or `proxy` must be configured")
 
     return Config(
         server=server,
         auth=auth,
         defaults=defaults,
         commands=commands,
-        mode=mode,
         proxy=proxy,
         config_path=path,
     )

@@ -12,8 +12,8 @@ named MCP tools, served over Streamable HTTP or stdio.
   **public**; access is gated by the unguessable 256-bit `run_id`
   (capability URLs).
 - The HTTP MCP endpoint requires `Authorization: Bearer <RCM_API_KEY>`;
-  stdio mode does not use API-key authentication.
-- Proxy mode can aggregate local or remote MCP servers and synchronize a local
+  stdio transport does not use API-key authentication.
+- A `proxy` configuration can aggregate local or remote MCP servers and synchronize a local
   workspace before each proxied tool call.
 
 ## Quickstart
@@ -100,14 +100,14 @@ Rules:
 - Optional per-param: `description`, `default`, `pattern` (regex), `enum`.
 - `name` must match `^[a-zA-Z_][a-zA-Z0-9_]*$` and be globally unique.
 
-## Proxy mode
+## Proxy and combined configurations
 
-Set `mode: proxy` to make rcm aggregate multiple MCP targets. Each direct child
-of `proxy` is a target; there is no additional `targets` configuration layer:
+Add a `proxy` block to aggregate multiple MCP targets. Each direct child of
+`proxy` is a target; there is no additional `targets` configuration layer.
+`commands` and `proxy` can be configured together: local commands keep their
+original names, while proxied tools are exposed as `<target>__<tool>`.
 
 ```yaml
-mode: proxy
-
 proxy:
   compile:
     transport: ssh
@@ -164,6 +164,10 @@ are returned as errors and do not fall back to stdio.
 Every proxied tool is exposed as `<target>__<tool>`, for example
 `compile__build`. Current rcm command tools have no additional name prefix.
 
+A configuration must contain at least one of `commands` or `proxy`. A proxy-only
+configuration may omit `commands`; a commands-only configuration may omit
+`proxy`.
+
 If `sync` is configured and `enabled` is not set to `false`, rcm runs one-way
 `rsync` from `source` to `destination` immediately before every `tools/call`.
 `enabled` defaults to `true`; `sync: {enabled: false}` disables it. For a
@@ -189,7 +193,7 @@ from non-rcm MCP services are passed through unchanged.
 ## HTTPS and self-signed certificates
 
 Native HTTPS is enabled with `server.tls.enabled: true`. The server requires
-`server.public_base_url` to use the `https://` scheme in this mode. For a
+`server.public_base_url` to use the `https://` scheme with HTTPS transport. For a
 manually managed certificate, provide both `cert_file` and `key_file`; paths
 relative to the YAML file are resolved relative to that file.
 
@@ -235,8 +239,9 @@ Configure the MCP client like:
 }
 ```
 
-In proxy mode, configure the same endpoint and call tools using their prefixed
-names, such as `compile__build`.
+When `proxy` is configured, use the same endpoint and call remote tools using
+their prefixed names, such as `compile__build`. Local command tools remain
+available under their original names.
 
 A `tools/call` for `tail_log` with `{lines: 100, file: "nginx.log"}` returns:
 
@@ -265,8 +270,8 @@ curl 'https://rcm.example.com/runs/k7Q.../stdout?tail=4096'
 
 | Variable | Purpose |
 |---|---|
-| `RCM_API_KEY` | Bearer token for HTTP MCP requests; required in HTTP mode and ignored in stdio mode. |
-| `RCM_PUBLIC_BASE_URL` | Public URL used to build HTTP download links. Required in HTTP mode (here or in YAML). |
+| `RCM_API_KEY` | Bearer token for HTTP MCP requests; required for HTTP transport and ignored for stdio transport. |
+| `RCM_PUBLIC_BASE_URL` | Public URL used to build HTTP download links. Required for HTTP transport (here or in YAML). |
 | `RCM_CONFIG` | Path to YAML config (default: `./commands.yaml`). |
 | `RCM_HOST` / `RCM_PORT` | Bind address/port (defaults: `0.0.0.0` / `8000`). |
 | `RCM_TLS_ENABLED` | Overrides `server.tls.enabled`. |

@@ -22,8 +22,7 @@ server:
 # To run as a local proxy instead of a command server, use this shape. The
 # target names are direct children of `proxy`; proxied tools are exposed as
 # <target>__<tool>.
-# mode: proxy
-# commands: []
+# Add `proxy` alongside `commands` to expose both local and proxied tools.
 # proxy:
 #   # Remote-config targets discover the transport from the remote YAML.
 #   remote_compile:

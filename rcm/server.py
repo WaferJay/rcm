@@ -165,13 +165,17 @@ def _register_download_routes(mcp: FastMCP, store: Store) -> None:
         return PlainTextResponse("ok")
 
 
+def _register_command_tools(mcp: FastMCP, cfg: Config, store: Store) -> None:
+    for spec in cfg.commands:
+        fn = _build_tool_fn(spec, cfg.defaults.timeout, cfg.defaults.cwd, store)
+        mcp.tool(fn)
+
+
 def build_server(cfg: Config, store: Store, api_key: str | None) -> FastMCP:
     mcp: FastMCP = FastMCP("rcm")
     if api_key is not None:
         mcp.add_middleware(ApiKeyAuth(api_key))
-    for spec in cfg.commands:
-        fn = _build_tool_fn(spec, cfg.defaults.timeout, cfg.defaults.cwd, store)
-        mcp.tool(fn)
+    _register_command_tools(mcp, cfg, store)
     _register_download_routes(mcp, store)
     return mcp
 
@@ -179,9 +183,14 @@ def build_server(cfg: Config, store: Store, api_key: str | None) -> FastMCP:
 async def build_proxy_server(
     cfg: Config, store: Store, api_key: str | None
 ) -> tuple[FastMCP, ProxyRuntime]:
-    """Build a proxy server after discovering all configured remote tools."""
+    """Build a server with local commands and discovered proxy tools."""
     runtime = await ProxyRuntime.create(cfg, api_key, store)
-    _register_download_routes(runtime.server, store)
+    try:
+        _register_command_tools(runtime.server, cfg, store)
+        _register_download_routes(runtime.server, store)
+    except Exception:
+        await runtime.close()
+        raise
     return runtime.server, runtime
 
 
@@ -295,7 +304,7 @@ def main() -> None:
         store.prune(retention)
 
     if stdio:
-        if cfg.mode == "server":
+        if cfg.proxy is None:
             build_server(cfg, store, api_key=None).run(transport="stdio")
             return
 
@@ -320,7 +329,7 @@ def main() -> None:
     uvicorn_config = uvicorn_tls_config(tls_files)
     scheme = "https" if tls_files is not None else "http"
 
-    if cfg.mode == "server":
+    if cfg.proxy is None:
         mcp = build_server(cfg, store, api_key)
         print(
             f"rcm: serving {len(cfg.commands)} command tool(s) "
