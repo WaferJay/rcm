@@ -30,6 +30,32 @@ server:
 # auth:
 #   api_key: change-me
 
+# To run as a local proxy instead of a command server, use this shape. The
+# target names are direct children of `proxy`; proxied tools are exposed as
+# <target>__<tool>.
+# mode: proxy
+# commands: []
+# proxy:
+#   compile:
+#     transport: ssh
+#     ssh:
+#       host: compile-machine
+#       command: [rcm, --stdio]
+#     sync:
+#       source: /home/me/project
+#       destination: /srv/project
+#       excludes: [".git/**", "build/**", "**/*.pyc"]
+#       delete: false
+#   local_tools:
+#     transport: stdio
+#     command: [uv, run, my-local-mcp]
+#   remote_tools:
+#     transport: http
+#     endpoint: https://remote.example.com/mcp
+#     headers:
+#       Authorization:
+#         env: REMOTE_MCP_AUTH
+
 # Optional defaults applied to every command.
 defaults:
   timeout: 30          # seconds

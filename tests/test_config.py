@@ -284,6 +284,47 @@ def test_load_webdav_config(tmp_path: Path) -> None:
     assert cfg.config_path == (tmp_path / "commands.yaml").resolve()
 
 
+def test_load_proxy_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REMOTE_MCP_AUTH", "Bearer env-token")
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            mode: proxy
+            proxy:
+              compile:
+                transport: ssh
+                ssh:
+                  host: compile-machine
+                  command: [rcm, --stdio]
+                sync:
+                  source: /local/project
+                  destination: /remote/project
+                  excludes: [".git/**", "**/*.pyc"]
+                  delete: false
+              tools:
+                transport: http
+                endpoint: https://example.com/mcp
+                headers:
+                  Authorization: {env: REMOTE_MCP_AUTH}
+                  X-Project: {value: compile}
+            """,
+        )
+    )
+
+    assert cfg.mode == "proxy"
+    assert cfg.commands == []
+    assert cfg.proxy is not None
+    compile_target, http_target = cfg.proxy.targets
+    assert compile_target.ssh is not None
+    assert compile_target.ssh.host == "compile-machine"
+    assert compile_target.sync is not None
+    assert compile_target.sync.excludes == [".git/**", "**/*.pyc"]
+    assert compile_target.sync.delete is False
+    assert http_target.headers["Authorization"].env == "REMOTE_MCP_AUTH"
+    assert http_target.headers["X-Project"].value == "compile"
+
+
 @pytest.mark.parametrize(
     "webdav, fragment",
     [
@@ -321,6 +362,69 @@ def test_invalid_webdav_configs_rejected(
                     description: Say hello.
                     command: ["echo", "hi"]
                 """,
+            )
+        )
+    assert fragment in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "body, fragment",
+    [
+        (
+            """
+            mode: proxy
+            commands: []
+            """,
+            "`proxy` is required",
+        ),
+        (
+            """
+            mode: proxy
+            commands: []
+            proxy:
+              target:
+                transport: http
+                endpoint: https://example.com/mcp
+                headers:
+                  Authorization: {env: TOKEN, value: plaintext}
+            """,
+            "must contain exactly one of",
+        ),
+        (
+            """
+            mode: proxy
+            commands: []
+            proxy:
+              target:
+                transport: stdio
+                command: [echo]
+                sync:
+                  source: /tmp/src
+                  destination: /tmp/dst
+                  excludes: [../secret]
+            """,
+            "must not contain empty, `.` or `..` path parts",
+        ),
+        (
+            """
+            mode: proxy
+            commands: []
+            proxy:
+              target:
+                transport: http
+            """,
+            "endpoint is required",
+        ),
+    ],
+)
+def test_invalid_proxy_configs_rejected(
+    tmp_path: Path, body: str, fragment: str
+) -> None:
+    with pytest.raises(ConfigError) as exc:
+        load_config(
+            write(
+                tmp_path,
+                "server: {public_base_url: http://x}\n" + textwrap.dedent(body),
             )
         )
     assert fragment in str(exc.value)

@@ -14,6 +14,8 @@ NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 PARAM_TYPES = {"string", "integer", "number", "boolean"}
 WEBDAV_AUTH_TYPES = {"basic", "bearer", "none"}
 WEBDAV_RESERVED_PATHS = ("/mcp", "/runs", "/healthz")
+MODES = {"server", "proxy"}
+PROXY_TRANSPORTS = {"stdio", "ssh", "http", "sse"}
 
 
 class ConfigError(ValueError):
@@ -93,11 +95,50 @@ class WebDAVSpec:
 
 
 @dataclass
+class HeaderSpec:
+    env: str | None = None
+    value: str | None = None
+
+
+@dataclass
+class SyncSpec:
+    source: str
+    destination: str
+    excludes: list[str] = field(default_factory=list)
+    delete: bool = False
+
+
+@dataclass
+class SSHSpec:
+    host: str
+    command: list[str]
+
+
+@dataclass
+class ProxyTargetSpec:
+    name: str
+    transport: str
+    command: list[str] | None = None
+    cwd: str | None = None
+    ssh: SSHSpec | None = None
+    endpoint: str | None = None
+    headers: dict[str, HeaderSpec] = field(default_factory=dict)
+    sync: SyncSpec | None = None
+
+
+@dataclass
+class ProxySpec:
+    targets: list[ProxyTargetSpec] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     server: ServerSpec
     auth: AuthSpec
     defaults: DefaultsSpec
     commands: list[CommandSpec]
+    mode: str = "server"
+    proxy: ProxySpec | None = None
     webdav: WebDAVSpec | None = None
     config_path: Path | None = None
 
@@ -289,6 +330,204 @@ def _parse_webdav_hide(raw: Any) -> WebDAVHideSpec:
     return WebDAVHideSpec(rcm=rcm, config=config, glob=glob)
 
 
+def _validate_proxy_glob(pattern: Any, index: int) -> str:
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise ConfigError(f"proxy.sync.excludes[{index}] must be a non-empty string")
+    pattern = pattern.strip()
+    if pattern.startswith("/") or "\\" in pattern:
+        raise ConfigError(
+            f"proxy.sync.excludes[{index}] must be a relative POSIX glob"
+        )
+
+    parts = pattern.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ConfigError(
+            f"proxy.sync.excludes[{index}] must not contain empty, `.` or `..` path parts"
+        )
+    for part in parts:
+        bracket_open = False
+        for char in part:
+            if char == "[":
+                if bracket_open:
+                    raise ConfigError(
+                        f"proxy.sync.excludes[{index}] has an invalid character class"
+                    )
+                bracket_open = True
+            elif char == "]":
+                if not bracket_open:
+                    raise ConfigError(
+                        f"proxy.sync.excludes[{index}] has an invalid character class"
+                    )
+                bracket_open = False
+        if bracket_open:
+            raise ConfigError(
+                f"proxy.sync.excludes[{index}] has an invalid character class"
+            )
+    return pattern
+
+
+def _parse_headers(raw: Any, target_name: str) -> dict[str, HeaderSpec]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"proxy.{target_name}.headers must be a mapping")
+
+    headers: dict[str, HeaderSpec] = {}
+    for header_name, header_raw in raw.items():
+        if not isinstance(header_name, str) or not header_name.strip():
+            raise ConfigError(
+                f"proxy.{target_name}.headers names must be non-empty strings"
+            )
+        if not isinstance(header_raw, dict):
+            raise ConfigError(
+                f"proxy.{target_name}.headers.{header_name} must be a mapping"
+            )
+        keys = set(header_raw)
+        if keys != {"env"} and keys != {"value"}:
+            raise ConfigError(
+                f"proxy.{target_name}.headers.{header_name} must contain exactly one of `env` or `value`"
+            )
+        source = next(iter(keys))
+        value = header_raw[source]
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"proxy.{target_name}.headers.{header_name}.{source} must be a non-empty string"
+            )
+        headers[header_name.strip()] = HeaderSpec(**{source: value})
+    return headers
+
+
+def _parse_sync(raw: Any, target_name: str) -> SyncSpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"proxy.{target_name}.sync must be a mapping")
+
+    source = raw.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise ConfigError(f"proxy.{target_name}.sync.source must be a non-empty string")
+    destination = raw.get("destination")
+    if not isinstance(destination, str) or not destination.strip():
+        raise ConfigError(
+            f"proxy.{target_name}.sync.destination must be a non-empty string"
+        )
+    excludes_raw = raw.get("excludes", [])
+    if not isinstance(excludes_raw, list):
+        raise ConfigError(f"proxy.{target_name}.sync.excludes must be a list")
+    excludes = [_validate_proxy_glob(pattern, i) for i, pattern in enumerate(excludes_raw)]
+
+    delete = raw.get("delete", False)
+    if not isinstance(delete, bool):
+        raise ConfigError(f"proxy.{target_name}.sync.delete must be a boolean")
+    return SyncSpec(
+        source=source.strip(),
+        destination=destination.strip(),
+        excludes=excludes,
+        delete=delete,
+    )
+
+
+def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
+    if not NAME_RE.fullmatch(name):
+        raise ConfigError(
+            f"proxy target name must match {NAME_RE.pattern!r}, got {name!r}"
+        )
+    if not isinstance(raw, dict):
+        raise ConfigError(f"proxy.{name} must be a mapping")
+
+    transport = raw.get("transport")
+    if not isinstance(transport, str) or transport not in PROXY_TRANSPORTS:
+        raise ConfigError(
+            f"proxy.{name}.transport must be one of {sorted(PROXY_TRANSPORTS)}, got {transport!r}"
+        )
+
+    command_raw = raw.get("command")
+    command: list[str] | None = None
+    if command_raw is not None:
+        if not isinstance(command_raw, list) or not command_raw:
+            raise ConfigError(f"proxy.{name}.command must be a non-empty list of strings")
+        if any(not isinstance(part, str) or not part for part in command_raw):
+            raise ConfigError(f"proxy.{name}.command must contain only non-empty strings")
+        command = command_raw
+
+    cwd = raw.get("cwd")
+    if cwd is not None and (not isinstance(cwd, str) or not cwd.strip()):
+        raise ConfigError(f"proxy.{name}.cwd must be a non-empty string")
+
+    ssh: SSHSpec | None = None
+    ssh_raw = raw.get("ssh")
+    if ssh_raw is not None:
+        if not isinstance(ssh_raw, dict):
+            raise ConfigError(f"proxy.{name}.ssh must be a mapping")
+        host = ssh_raw.get("host")
+        if not isinstance(host, str) or not host.strip():
+            raise ConfigError(f"proxy.{name}.ssh.host must be a non-empty string")
+        ssh_command_raw = ssh_raw.get("command")
+        if (
+            not isinstance(ssh_command_raw, list)
+            or not ssh_command_raw
+            or any(not isinstance(part, str) or not part for part in ssh_command_raw)
+        ):
+            raise ConfigError(
+                f"proxy.{name}.ssh.command must be a non-empty list of strings"
+            )
+        ssh = SSHSpec(host=host.strip(), command=ssh_command_raw)
+
+    endpoint = raw.get("endpoint")
+    if endpoint is not None and (
+        not isinstance(endpoint, str)
+        or not endpoint.strip()
+        or not endpoint.strip().startswith(("http://", "https://"))
+    ):
+        raise ConfigError(
+            f"proxy.{name}.endpoint must be an http:// or https:// URL"
+        )
+
+    if transport == "stdio" and command is None:
+        raise ConfigError(f"proxy.{name}.command is required for stdio transport")
+    if transport == "ssh" and ssh is None:
+        raise ConfigError(f"proxy.{name}.ssh is required for ssh transport")
+    if transport in {"http", "sse"} and endpoint is None:
+        raise ConfigError(f"proxy.{name}.endpoint is required for {transport} transport")
+
+    if transport == "ssh" and command is not None:
+        raise ConfigError(f"proxy.{name}.command is not used with ssh transport")
+    if transport in {"http", "sse"} and command is not None:
+        raise ConfigError(f"proxy.{name}.command is not used with {transport} transport")
+    if transport != "ssh" and ssh is not None:
+        raise ConfigError(f"proxy.{name}.ssh is only valid for ssh transport")
+    if transport not in {"http", "sse"} and endpoint is not None:
+        raise ConfigError(f"proxy.{name}.endpoint is only valid for http or sse transport")
+    if transport not in {"http", "sse"} and raw.get("headers") is not None:
+        raise ConfigError(f"proxy.{name}.headers is only valid for http or sse transport")
+    if transport != "stdio" and cwd is not None:
+        raise ConfigError(f"proxy.{name}.cwd is only valid for stdio transport")
+
+    return ProxyTargetSpec(
+        name=name,
+        transport=transport,
+        command=command,
+        cwd=cwd.strip() if isinstance(cwd, str) else None,
+        ssh=ssh,
+        endpoint=endpoint.strip() if isinstance(endpoint, str) else None,
+        headers=_parse_headers(raw.get("headers"), name),
+        sync=_parse_sync(raw.get("sync"), name),
+    )
+
+
+def _parse_proxy(raw: Any) -> ProxySpec:
+    if not isinstance(raw, dict) or not raw:
+        raise ConfigError("`proxy` must be a non-empty mapping")
+    names: set[str] = set()
+    targets: list[ProxyTargetSpec] = []
+    for name, target_raw in raw.items():
+        if name in names:
+            raise ConfigError(f"duplicate proxy target name: {name!r}")
+        names.add(name)
+        targets.append(_parse_proxy_target(name, target_raw))
+    return ProxySpec(targets=targets)
+
+
 def _parse_tls(raw: Any) -> TLSConfig:
     if not isinstance(raw, dict):
         raise ConfigError("server.tls must be a mapping")
@@ -401,6 +640,10 @@ def load_config(path: str | Path) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError(f"top-level YAML must be a mapping in {path}")
 
+    mode = raw.get("mode", "server")
+    if not isinstance(mode, str) or mode not in MODES:
+        raise ConfigError(f"`mode` must be one of {sorted(MODES)}, got {mode!r}")
+
     server_raw = raw.get("server") or {}
     if not isinstance(server_raw, dict):
         raise ConfigError("`server` must be a mapping")
@@ -426,8 +669,8 @@ def load_config(path: str | Path) -> Config:
         cwd=defaults_raw.get("cwd"),
     )
 
-    commands_raw = raw.get("commands")
-    if not isinstance(commands_raw, list) or not commands_raw:
+    commands_raw = raw.get("commands", [])
+    if not isinstance(commands_raw, list) or (mode == "server" and not commands_raw):
         raise ConfigError("`commands` must be a non-empty list")
     commands = [_parse_command(c) for c in commands_raw]
 
@@ -437,6 +680,12 @@ def load_config(path: str | Path) -> Config:
             raise ConfigError(f"duplicate command name: {cmd.name!r}")
         seen.add(cmd.name)
 
+    proxy = _parse_proxy(raw["proxy"]) if "proxy" in raw else None
+    if mode == "proxy" and proxy is None:
+        raise ConfigError("`proxy` is required when mode is `proxy`")
+    if mode == "server" and proxy is not None:
+        raise ConfigError("`proxy` is only valid when mode is `proxy`")
+
     webdav = _parse_webdav(raw["webdav"]) if "webdav" in raw else None
 
     return Config(
@@ -444,6 +693,8 @@ def load_config(path: str | Path) -> Config:
         auth=auth,
         defaults=defaults,
         commands=commands,
+        mode=mode,
+        proxy=proxy,
         webdav=webdav,
         config_path=path,
     )

@@ -13,6 +13,8 @@ named MCP tools, served over **HTTP Streaming** (Streamable HTTP transport).
   (capability URLs).
 - The MCP endpoint itself requires `Authorization: Bearer <RCM_API_KEY>`.
 - An optional WebDAV share can be mounted on the same HTTP server.
+- Proxy mode can aggregate local or remote MCP servers and synchronize a local
+  workspace before each proxied tool call.
 
 ## Quickstart
 
@@ -105,6 +107,65 @@ Rules:
 - Optional per-param: `description`, `default`, `pattern` (regex), `enum`.
 - `name` must match `^[a-zA-Z_][a-zA-Z0-9_]*$` and be globally unique.
 
+## Proxy mode
+
+Set `mode: proxy` to make rcm aggregate multiple MCP targets. Each direct child
+of `proxy` is a target; there is no additional `targets` configuration layer:
+
+```yaml
+mode: proxy
+
+proxy:
+  compile:
+    transport: ssh
+    ssh:
+      host: compile-machine
+      command: [rcm, --stdio]
+    sync:
+      source: /home/me/project
+      destination: /srv/project
+      excludes:
+        - .git/**
+        - build/**
+        - '**/*.pyc'
+      delete: false
+
+  local_tools:
+    transport: stdio
+    command: [uv, run, my-local-mcp]
+    cwd: /home/me/tools
+
+  reports:
+    transport: http
+    endpoint: https://reports.example.com/mcp
+    headers:
+      Authorization:
+        env: REPORTS_MCP_AUTH
+      X-Project:
+        value: compile
+```
+
+Supported transports are `stdio` (local command), `ssh` (remote command),
+`http` (Streamable HTTP), and `sse`. HTTP/SSE headers use exactly one of
+`env` or `value`; an environment variable that is missing or empty is an
+error, while `value` permits a directly configured header value.
+
+Every proxied tool is exposed as `<target>__<tool>`, for example
+`compile__build`. Current rcm command tools have no additional name prefix.
+
+If `sync` is configured, rcm runs one-way `rsync` from `source` to
+`destination` immediately before every `tools/call`. A failed sync blocks the
+remote call. `excludes` are relative POSIX globs and support `*`, `?`,
+character classes, and recursive `**`. The file loaded through `RCM_CONFIG` is
+automatically excluded whenever it is inside the configured source directory.
+`delete` defaults to `false` and must be explicitly enabled to remove files
+that exist only at the destination.
+
+The proxy uses the Python `mcp-proxy` bridge for HTTP/SSE targets when
+available. SSH credentials are taken from the local OpenSSH configuration,
+agent, and keys. The local machine must provide `rsync` for synchronized
+targets and `ssh` for SSH targets.
+
 ## HTTPS and self-signed certificates
 
 Native HTTPS is enabled with `server.tls.enabled: true`. The server requires
@@ -181,6 +242,9 @@ Configure the MCP client like:
 }
 ```
 
+In proxy mode, configure the same endpoint and call tools using their prefixed
+names, such as `compile__build`.
+
 A `tools/call` for `tail_log` with `{lines: 100, file: "nginx.log"}` returns:
 
 ```json
@@ -219,6 +283,7 @@ curl 'https://rcm.example.com/runs/k7Q.../stdout?tail=4096'
 | `RCM_RUNS_DIR` | Where stdout/stderr/meta are written (default: `./runs`). |
 | `RCM_RUNS_RETENTION` | Keep at most N runs on disk (pruned at startup). `0` = keep all. |
 | `RCM_WEBDAV_PASSWORD` | Overrides the configured WebDAV Basic-auth password. |
+| Target header `env` values | Environment variables referenced by proxy target headers are resolved at startup. |
 
 ## Building a standalone binary (Nuitka)
 
@@ -248,6 +313,8 @@ packages are installed and includes them. Key caveats:
 - Python 3.14 support in Nuitka is experimental; 3.12-3.13 are safer.
 - For onefile mode, add `--onefile-tempdir-spec={CACHE_DIR}/rcm` to avoid
   re-extracting on every launch (already set in `build.sh`).
+- Proxy synchronization still requires the host's `rsync` and, for SSH
+  targets, the host's `ssh` client.
 
 ## Notes
 

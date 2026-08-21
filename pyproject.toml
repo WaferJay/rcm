@@ -1,13 +1,14 @@
 [project]
 name = "rcm"
 version = "0.1.0"
-description = "Remote Command MCP Server with optional WebDAV support"
+description = "Remote Command MCP Server with WebDAV and MCP proxy support"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "a2wsgi>=1.10",
     "cryptography>=43",
     "fastmcp>=2.0",
+    "mcp-proxy>=0.12,<0.13",
     "pyyaml>=6",
     "wsgidav>=4.3",
 ]
