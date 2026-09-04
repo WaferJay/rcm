@@ -30,6 +30,7 @@ from rcm.proxy import (
     _discover_remote_stdio_command,
     _read_remote_metadata,
     _resolve_remote_target,
+    _ssh_command,
 )
 from rcm.server import build_proxy_server
 from rcm.store import Store
@@ -53,6 +54,36 @@ class FakeSync:
 
     async def sync(self) -> None:
         self.calls += 1
+
+
+@pytest.mark.asyncio
+async def test_ssh_command_does_not_inherit_mcp_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"remote output", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = await _ssh_command("compile-machine", "cat -- /etc/rcm/config.yaml")
+
+    assert result == (0, "remote output", "")
+    assert captured["args"] == (
+        "ssh",
+        "compile-machine",
+        "cat -- /etc/rcm/config.yaml",
+    )
+    assert captured["kwargs"]["stdin"] is asyncio.subprocess.DEVNULL
 
 
 @pytest.mark.asyncio

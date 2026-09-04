@@ -57,6 +57,7 @@ async def _ssh_command(host: str, command: str) -> tuple[int, str, str]:
             "ssh",
             host,
             command,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
