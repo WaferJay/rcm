@@ -130,7 +130,14 @@ proxy:
       host: compile-machine
     config: /etc/rcm/commands.yaml
     sync:
-      enabled: true
+      mappings:
+        # Relative destinations are resolved below the remote defaults.cwd.
+        - source: /home/me/project/backend
+          destination: backend
+          excludes: ['**/*.pyc']
+          delete: false
+        - source: /home/me/project/shared
+          destination: shared
 
   local_tools:
     transport: stdio
@@ -168,17 +175,34 @@ A configuration must contain at least one of `commands` or `proxy`. A proxy-only
 configuration may omit `commands`; a commands-only configuration may omit
 `proxy`.
 
-If `sync` is configured and `enabled` is not set to `false`, rcm runs one-way
-`rsync` from `source` to `destination` immediately before every `tools/call`.
-`enabled` defaults to `true`; `sync: {enabled: false}` disables it. For a
-remote-config target, omitted `source` defaults to the local working
-directory, and omitted `destination` defaults to the remote `defaults.cwd`
-or the directory containing the remote config. Explicit values override these
-defaults. A failed sync blocks the remote call. `excludes` are relative POSIX globs and support `*`, `?`,
-character classes, and recursive `**`. The file loaded through `RCM_CONFIG` is
-automatically excluded whenever it is inside the configured source directory.
-`delete` defaults to `false` and must be explicitly enabled to remove files
-that exist only at the destination.
+For an explicitly configured target, adding `sync` runs one-way `rsync`
+immediately before every `tools/call`. A remote-config target keeps the legacy
+behavior of synchronizing the local working directory even when `sync` is
+omitted; rcm logs a warning for this implicit full-directory sync. Use
+`sync: {enabled: false}` to disable it.
+
+`sync.mappings` accepts one or more independent `source` and `destination`
+pairs. They run in order under one target-level lock, and each mapping has its
+own `excludes` and `delete` options. A failed mapping stops the remaining
+mappings and blocks the remote call. The legacy single-mapping fields directly
+under `sync` remain supported, but cannot be mixed with `mappings`.
+
+For `ssh` plus `config`, a relative destination is resolved below the remote
+`defaults.cwd`, falling back to the directory containing the remote config.
+For an explicit SSH target it is relative to the SSH login directory, matching
+native rsync behavior. Local destinations are relative to the proxy process's
+working directory. Absolute paths and existing explicit `host:path`
+destinations retain their current meaning. Relative destination paths must use
+POSIX separators and cannot contain empty, `.`, or `..` components or `~`.
+
+`excludes` are relative POSIX globs and support `*`, `?`, character classes,
+and recursive `**`. In addition, rcm always protects the active local config,
+the local `RCM_RUNS_DIR` (default `./runs`), a remote config located below the
+destination, and the destination's top-level `runs/` directory. These paths
+are protected from both transfer and `--delete` and cannot be overridden.
+`delete` defaults to `false`. Destinations may overlap when all involved
+mappings have deletion disabled; if either overlapping mapping enables
+deletion, rcm rejects the target during startup.
 
 The proxy uses the Python `mcp-proxy` bridge for HTTP/SSE targets when
 available. SSH credentials are taken from the local OpenSSH configuration,

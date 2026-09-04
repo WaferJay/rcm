@@ -30,7 +30,13 @@ server:
 #       host: compile-machine
 #     config: /etc/rcm/commands.yaml
 #     sync:
-#       enabled: true
+#       mappings:
+#         - source: /home/me/project/backend
+#           destination: backend
+#           excludes: ["**/*.pyc"]
+#           delete: false
+#         - source: /home/me/project/shared
+#           destination: shared
 #   compile:
 #     transport: ssh
 #     ssh:

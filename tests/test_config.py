@@ -308,11 +308,51 @@ def test_load_proxy_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert compile_target.ssh is not None
     assert compile_target.ssh.host == "compile-machine"
     assert compile_target.sync is not None
-    assert compile_target.sync.excludes == [".git/**", "**/*.pyc"]
-    assert compile_target.sync.delete is False
     assert compile_target.sync.enabled is True
+    assert len(compile_target.sync.mappings) == 1
+    mapping = compile_target.sync.mappings[0]
+    assert mapping.source == "/local/project"
+    assert mapping.destination == "/remote/project"
+    assert mapping.excludes == [".git/**", "**/*.pyc"]
+    assert mapping.delete is False
     assert http_target.headers["Authorization"].env == "REMOTE_MCP_AUTH"
     assert http_target.headers["X-Project"].value == "compile"
+
+
+def test_load_multi_mapping_sync_config(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            proxy:
+              compile:
+                transport: ssh
+                ssh:
+                  host: compile-machine
+                  command: [rcm, --stdio]
+                sync:
+                  mappings:
+                    - source: ./backend
+                      destination: backend
+                      excludes: ["**/*.pyc"]
+                    - source: ./shared
+                      destination: /srv/project/shared
+                      delete: true
+            """,
+        )
+    )
+
+    sync = cfg.proxy.targets[0].sync
+    assert sync is not None
+    assert sync.enabled is True
+    assert len(sync.mappings) == 2
+    assert sync.mappings[0].source == "./backend"
+    assert sync.mappings[0].destination == "backend"
+    assert sync.mappings[0].excludes == ["**/*.pyc"]
+    assert sync.mappings[0].delete is False
+    assert sync.mappings[1].source == "./shared"
+    assert sync.mappings[1].destination == "/srv/project/shared"
+    assert sync.mappings[1].delete is True
 
 
 def test_load_commands_and_proxy_together(tmp_path: Path) -> None:
@@ -458,6 +498,95 @@ def test_sync_enabled_false_is_parsed(tmp_path: Path) -> None:
     )
     assert cfg.proxy.targets[0].sync is not None
     assert cfg.proxy.targets[0].sync.enabled is False
+    assert cfg.proxy.targets[0].sync.mappings == []
+
+
+@pytest.mark.parametrize(
+    "sync_body, fragment",
+    [
+        (
+            """
+            source: ./legacy
+            destination: legacy
+            mappings:
+              - source: ./new
+                destination: new
+            """,
+            "cannot combine `mappings`",
+        ),
+        ("mappings: []", "mappings must be a non-empty list"),
+        (
+            """
+            enabled: false
+            mappings:
+              - source: ./src
+                destination: dst
+            """,
+            "cannot configure mappings when enabled is false",
+        ),
+        (
+            """
+            mappings:
+              - destination: dst
+            """,
+            "mappings[0].source is required",
+        ),
+        (
+            """
+            mappings:
+              - source: ./src
+            """,
+            "mappings[0].destination is required",
+        ),
+        (
+            """
+            mappings:
+              - source: ./src
+                destination: ../escape
+            """,
+            "must not contain empty, `.` or `..` path parts",
+        ),
+        (
+            """
+            mappings:
+              - source: ./src
+                destination: ./nested
+            """,
+            "must not contain empty, `.` or `..` path parts",
+        ),
+        (
+            """
+            mappings:
+              - source: ./src
+                destination: ~/nested
+            """,
+            "without `~`",
+        ),
+        (
+            """
+            mappings:
+              - source: ./src
+                destination: :nested
+            """,
+            "must contain a host before `:`",
+        ),
+    ],
+)
+def test_invalid_sync_mappings_rejected(
+    tmp_path: Path, sync_body: str, fragment: str
+) -> None:
+    body = """
+        proxy:
+          target:
+            transport: ssh
+            ssh:
+              host: compile-machine
+              command: [rcm, --stdio]
+            sync:
+    """ + textwrap.indent(textwrap.dedent(sync_body), " " * 14)
+    with pytest.raises(ConfigError) as exc:
+        load_config(write(tmp_path, body))
+    assert fragment in str(exc.value)
 
 
 def test_webdav_config_rejected(tmp_path: Path) -> None:

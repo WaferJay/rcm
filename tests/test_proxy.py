@@ -23,12 +23,15 @@ from rcm.config import (
     RemoteConfigSpec,
     SSHSpec,
     ServerSpec,
+    SyncMappingSpec,
+    SyncSpec,
 )
 from rcm.proxy import (
     ProxyTool,
     RemoteServerMetadata,
     _discover_remote_stdio_command,
     _read_remote_metadata,
+    _remote_sync_spec,
     _resolve_remote_target,
     _ssh_command,
 )
@@ -180,7 +183,9 @@ async def test_proxy_tool_materializes_rcm_inline_artifact(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_remote_http_config_resolves_without_stdio_discovery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import rcm.proxy as proxy_module
 
@@ -218,10 +223,12 @@ async def test_remote_http_config_resolves_without_stdio_discovery(
     assert resolved.headers["Authorization"].value == "Bearer remote-key"
     assert resolved.headers["X-Local"].value == "local"
     assert resolved.sync is not None
-    assert resolved.sync.source == str(tmp_path)
-    assert resolved.sync.destination == "/srv/project"
-    assert resolved.sync.excludes == []
-    assert resolved.sync.delete is False
+    mapping = resolved.sync.mappings[0]
+    assert mapping.source == str(tmp_path)
+    assert mapping.destination == "/srv/project"
+    assert mapping.excludes == []
+    assert mapping.delete is False
+    assert "implicit full-directory sync" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -318,8 +325,49 @@ async def test_remote_stdio_config_discovers_rcm_and_keeps_remote_config(
     assert resolved.remote_config is not None
     assert resolved.remote_config.path == "/etc/rcm/commands.yaml"
     assert resolved.sync is not None
-    assert resolved.sync.source == str(tmp_path)
-    assert resolved.sync.destination == "/srv/project"
+    mapping = resolved.sync.mappings[0]
+    assert mapping.source == str(tmp_path)
+    assert mapping.destination == "/srv/project"
+
+
+@pytest.mark.parametrize(
+    "cwd, destination, expected",
+    [
+        ("/srv/project", "backend", "/srv/project/backend"),
+        (None, "backend", "/etc/rcm/backend"),
+        ("/srv/project", "/opt/backend", "/opt/backend"),
+        ("/srv/project", "other-host:backend", "other-host:backend"),
+    ],
+)
+def test_remote_sync_resolves_relative_destinations(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    cwd: str | None,
+    destination: str,
+    expected: str,
+) -> None:
+    remote_config = RemoteConfigSpec(path="/etc/rcm/commands.yaml")
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="remote",
+        ssh=SSHSpec(host="compile-machine"),
+        remote_config=remote_config,
+        sync=SyncSpec(
+            mappings=[
+                SyncMappingSpec(source=str(tmp_path), destination=destination)
+            ]
+        ),
+    )
+
+    resolved = _remote_sync_spec(
+        target,
+        remote_config,
+        RemoteServerMetadata(transport="stdio", cwd=cwd),
+    )
+
+    assert resolved is not None
+    assert resolved.mappings[0].destination == expected
+    assert "implicit full-directory sync" not in caplog.text
 
 
 @pytest.mark.asyncio

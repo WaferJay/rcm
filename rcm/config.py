@@ -77,12 +77,71 @@ class HeaderSpec:
 
 
 @dataclass
-class SyncSpec:
+class SyncMappingSpec:
     source: str | None = None
     destination: str | None = None
     excludes: list[str] = field(default_factory=list)
     delete: bool = False
+
+
+@dataclass(init=False)
+class SyncSpec:
+    mappings: list[SyncMappingSpec] = field(default_factory=list)
     enabled: bool = True
+
+    def __init__(
+        self,
+        mappings: list[SyncMappingSpec] | None = None,
+        enabled: bool = True,
+        *,
+        source: str | None = None,
+        destination: str | None = None,
+        excludes: list[str] | None = None,
+        delete: bool = False,
+    ) -> None:
+        """Build a sync spec, accepting the former single-mapping API."""
+        legacy = (
+            source is not None
+            or destination is not None
+            or excludes is not None
+            or delete
+        )
+        if mappings is not None and legacy:
+            raise TypeError("mappings cannot be combined with legacy sync fields")
+        if mappings is None and legacy:
+            mappings = [
+                SyncMappingSpec(
+                    source=source,
+                    destination=destination,
+                    excludes=list(excludes or []),
+                    delete=delete,
+                )
+            ]
+        self.mappings = list(mappings or [])
+        self.enabled = enabled
+
+    def _single_mapping(self) -> SyncMappingSpec | None:
+        return self.mappings[0] if len(self.mappings) == 1 else None
+
+    @property
+    def source(self) -> str | None:
+        mapping = self._single_mapping()
+        return mapping.source if mapping is not None else None
+
+    @property
+    def destination(self) -> str | None:
+        mapping = self._single_mapping()
+        return mapping.destination if mapping is not None else None
+
+    @property
+    def excludes(self) -> list[str]:
+        mapping = self._single_mapping()
+        return mapping.excludes if mapping is not None else []
+
+    @property
+    def delete(self) -> bool:
+        mapping = self._single_mapping()
+        return mapping.delete if mapping is not None else False
 
 
 @dataclass
@@ -233,19 +292,17 @@ def _parse_command(raw: dict[str, Any]) -> CommandSpec:
     )
 
 
-def _validate_proxy_glob(pattern: Any, index: int) -> str:
+def _validate_proxy_glob(pattern: Any, index: int, context: str) -> str:
     if not isinstance(pattern, str) or not pattern.strip():
-        raise ConfigError(f"proxy.sync.excludes[{index}] must be a non-empty string")
+        raise ConfigError(f"{context}.excludes[{index}] must be a non-empty string")
     pattern = pattern.strip()
     if pattern.startswith("/") or "\\" in pattern:
-        raise ConfigError(
-            f"proxy.sync.excludes[{index}] must be a relative POSIX glob"
-        )
+        raise ConfigError(f"{context}.excludes[{index}] must be a relative POSIX glob")
 
     parts = pattern.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise ConfigError(
-            f"proxy.sync.excludes[{index}] must not contain empty, `.` or `..` path parts"
+            f"{context}.excludes[{index}] must not contain empty, `.` or `..` path parts"
         )
     for part in parts:
         bracket_open = False
@@ -253,20 +310,89 @@ def _validate_proxy_glob(pattern: Any, index: int) -> str:
             if char == "[":
                 if bracket_open:
                     raise ConfigError(
-                        f"proxy.sync.excludes[{index}] has an invalid character class"
+                        f"{context}.excludes[{index}] has an invalid character class"
                     )
                 bracket_open = True
             elif char == "]":
                 if not bracket_open:
                     raise ConfigError(
-                        f"proxy.sync.excludes[{index}] has an invalid character class"
+                        f"{context}.excludes[{index}] has an invalid character class"
                     )
                 bracket_open = False
         if bracket_open:
             raise ConfigError(
-                f"proxy.sync.excludes[{index}] has an invalid character class"
+                f"{context}.excludes[{index}] has an invalid character class"
             )
     return pattern
+
+
+def _parse_sync_destination(raw: Any, context: str) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError(f"{context}.destination must be a non-empty string")
+
+    destination = raw.strip()
+    first_slash = destination.find("/")
+    colon = destination.find(":")
+    host_qualified = colon >= 0 and (first_slash < 0 or colon < first_slash)
+    if host_qualified and colon == 0:
+        raise ConfigError(f"{context}.destination must contain a host before `:`")
+    path = destination[colon + 1 :] if host_qualified else destination
+    if not path:
+        raise ConfigError(f"{context}.destination must contain a path")
+    if "\\" in path or "~" in path:
+        raise ConfigError(
+            f"{context}.destination must be an absolute or relative POSIX path "
+            "without `~`"
+        )
+
+    trimmed = path.rstrip("/") or "/"
+    parts = [] if trimmed == "/" else trimmed.split("/")
+    if trimmed.startswith("/") and trimmed != "/":
+        parts = parts[1:]
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ConfigError(
+            f"{context}.destination must not contain empty, `.` or `..` path parts"
+        )
+    return destination
+
+
+def _parse_sync_mapping(
+    raw: Any,
+    context: str,
+    *,
+    require_paths: bool,
+) -> SyncMappingSpec:
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{context} must be a mapping")
+
+    source = raw.get("source")
+    if source is not None and (not isinstance(source, str) or not source.strip()):
+        raise ConfigError(f"{context}.source must be a non-empty string")
+    destination = _parse_sync_destination(raw.get("destination"), context)
+    if require_paths and source is None:
+        raise ConfigError(f"{context}.source is required")
+    if require_paths and destination is None:
+        raise ConfigError(f"{context}.destination is required")
+
+    excludes_raw = raw.get("excludes", [])
+    if not isinstance(excludes_raw, list):
+        raise ConfigError(f"{context}.excludes must be a list")
+    excludes = [
+        _validate_proxy_glob(pattern, i, context)
+        for i, pattern in enumerate(excludes_raw)
+    ]
+
+    delete = raw.get("delete", False)
+    if not isinstance(delete, bool):
+        raise ConfigError(f"{context}.delete must be a boolean")
+    return SyncMappingSpec(
+        source=source.strip() if isinstance(source, str) else None,
+        destination=destination,
+        excludes=excludes,
+        delete=delete,
+    )
 
 
 def _parse_headers(raw: Any, target_name: str) -> dict[str, HeaderSpec]:
@@ -306,34 +432,41 @@ def _parse_sync(raw: Any, target_name: str) -> SyncSpec | None:
     if not isinstance(raw, dict):
         raise ConfigError(f"proxy.{target_name}.sync must be a mapping")
 
-    source = raw.get("source")
-    if source is not None and (not isinstance(source, str) or not source.strip()):
-        raise ConfigError(f"proxy.{target_name}.sync.source must be a non-empty string")
-    destination = raw.get("destination")
-    if destination is not None and (
-        not isinstance(destination, str) or not destination.strip()
-    ):
-        raise ConfigError(
-            f"proxy.{target_name}.sync.destination must be a non-empty string"
-        )
-    excludes_raw = raw.get("excludes", [])
-    if not isinstance(excludes_raw, list):
-        raise ConfigError(f"proxy.{target_name}.sync.excludes must be a list")
-    excludes = [_validate_proxy_glob(pattern, i) for i, pattern in enumerate(excludes_raw)]
-
-    delete = raw.get("delete", False)
-    if not isinstance(delete, bool):
-        raise ConfigError(f"proxy.{target_name}.sync.delete must be a boolean")
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ConfigError(f"proxy.{target_name}.sync.enabled must be a boolean")
-    return SyncSpec(
-        source=source.strip() if isinstance(source, str) else None,
-        destination=destination.strip() if isinstance(destination, str) else None,
-        excludes=excludes,
-        delete=delete,
-        enabled=enabled,
-    )
+
+    legacy_keys = {"source", "destination", "excludes", "delete"}
+    has_legacy = any(key in raw for key in legacy_keys)
+    has_mappings = "mappings" in raw
+    if has_legacy and has_mappings:
+        raise ConfigError(
+            f"proxy.{target_name}.sync cannot combine `mappings` with legacy "
+            "source/destination/excludes/delete fields"
+        )
+    if not enabled:
+        if has_legacy or has_mappings:
+            raise ConfigError(
+                f"proxy.{target_name}.sync cannot configure mappings when enabled is false"
+            )
+        return SyncSpec(enabled=False)
+
+    context = f"proxy.{target_name}.sync"
+    if has_mappings:
+        mappings_raw = raw["mappings"]
+        if not isinstance(mappings_raw, list) or not mappings_raw:
+            raise ConfigError(f"{context}.mappings must be a non-empty list")
+        mappings = [
+            _parse_sync_mapping(
+                mapping_raw,
+                f"{context}.mappings[{index}]",
+                require_paths=True,
+            )
+            for index, mapping_raw in enumerate(mappings_raw)
+        ]
+    else:
+        mappings = [_parse_sync_mapping(raw, context, require_paths=False)]
+    return SyncSpec(mappings=mappings, enabled=True)
 
 
 def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
@@ -446,8 +579,9 @@ def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
             raise ConfigError(f"proxy.{name} cannot combine config with cwd")
 
     sync = _parse_sync(raw.get("sync"), name)
-    if transport != "remote" and sync is not None and sync.enabled and (
-        sync.source is None or sync.destination is None
+    if transport != "remote" and sync is not None and sync.enabled and any(
+        mapping.source is None or mapping.destination is None
+        for mapping in sync.mappings
     ):
         raise ConfigError(
             f"proxy.{name}.sync.source and sync.destination are required for explicit transports"
@@ -477,7 +611,14 @@ def _parse_proxy(raw: Any) -> ProxySpec:
         names.add(name)
         if name == "sync" and isinstance(target_raw, dict) and any(
             key in target_raw
-            for key in {"enabled", "source", "destination", "excludes", "delete"}
+            for key in {
+                "enabled",
+                "source",
+                "destination",
+                "excludes",
+                "delete",
+                "mappings",
+            }
         ):
             raise ConfigError(
                 "`proxy.sync` is not a top-level setting; put it under a proxy "

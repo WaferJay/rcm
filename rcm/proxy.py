@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import logging
 import os
+import posixpath
 import shlex
 import shutil
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -33,10 +35,14 @@ from .config import (
     HeaderSpec,
     ProxyTargetSpec,
     RemoteConfigSpec,
+    SyncMappingSpec,
     SyncSpec,
 )
 from .store import Store
 from .sync import SyncError, SyncRunner
+
+
+logger = logging.getLogger(__name__)
 
 
 class ProxyError(RuntimeError):
@@ -190,13 +196,42 @@ def _remote_sync_spec(
         return None
 
     source = str(Path.cwd())
-    destination = metadata.cwd or str(Path(remote_config.path).parent)
+    destination_base = metadata.cwd or str(PurePosixPath(remote_config.path).parent)
     if configured is None:
-        return SyncSpec(source=source, destination=destination)
+        logger.warning(
+            "proxy target %r is using implicit full-directory sync (%s -> %s); "
+            "configure sync.mappings or sync.enabled: false to make this explicit",
+            target.name,
+            source,
+            destination_base,
+        )
+        return SyncSpec(
+            mappings=[
+                SyncMappingSpec(source=source, destination=destination_base)
+            ]
+        )
+
+    mappings: list[SyncMappingSpec] = []
+    for mapping in configured.mappings:
+        destination = mapping.destination
+        if destination is None:
+            destination = destination_base
+        else:
+            first_slash = destination.find("/")
+            colon = destination.find(":")
+            host_qualified = colon >= 0 and (first_slash < 0 or colon < first_slash)
+            if not destination.startswith("/") and not host_qualified:
+                destination = posixpath.join(destination_base, destination)
+        mappings.append(
+            replace(
+                mapping,
+                source=mapping.source or source,
+                destination=destination,
+            )
+        )
     return replace(
         configured,
-        source=configured.source or source,
-        destination=configured.destination or destination,
+        mappings=mappings,
         enabled=True,
     )
 
@@ -454,6 +489,24 @@ class ProxyRuntime:
                     if configured_target.remote_config is not None
                     else configured_target
                 )
+                try:
+                    sync_runner = (
+                        SyncRunner(
+                            target,
+                            cfg.config_path,
+                            remote_config_path=(
+                                configured_target.remote_config.path
+                                if configured_target.remote_config is not None
+                                else None
+                            ),
+                        )
+                        if target.sync is not None and target.sync.enabled
+                        else None
+                    )
+                except SyncError as exc:
+                    raise ProxyError(
+                        f"invalid sync configuration for target {target.name!r}: {exc}"
+                    ) from exc
                 client = await stack.enter_async_context(
                     Client(
                         _build_transport(target),
@@ -461,11 +514,6 @@ class ProxyRuntime:
                     )
                 )
                 remote_tools = await client.list_tools()
-                sync_runner = (
-                    SyncRunner(target, cfg.config_path)
-                    if target.sync is not None and target.sync.enabled
-                    else None
-                )
                 for remote_tool in remote_tools:
                     remote_name = remote_tool.name
                     public_name = f"{target.name}__{remote_name}"
