@@ -17,6 +17,8 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
+from . import __version__
+from .artifacts import RCM_EXPERIMENTAL_CAPABILITIES
 from .auth import ApiKeyAuth
 from .config import CommandSpec, Config, ParamSpec, TLSConfig, load_config
 from .runner import run_command
@@ -87,9 +89,8 @@ def _format_docstring(spec: CommandSpec) -> str:
         lines.append("")
     lines.extend(
         [
-            "Returns a dict with: run_id, returncode, timed_out, duration_ms,",
-            "stdout_bytes, stderr_bytes, stdout_url, stderr_url.",
-            "Stdout and stderr are downloaded from the URLs (no auth needed; the run_id is the secret).",
+            "Returns an rcm.run-result/v2 dict. Its stdout and stderr entries contain",
+            "a URI, byte count, and SHA-256 digest. The run_id is the URL secret.",
         ]
     )
     return "\n".join(lines)
@@ -172,7 +173,11 @@ def _register_command_tools(mcp: FastMCP, cfg: Config, store: Store) -> None:
 
 
 def build_server(cfg: Config, store: Store, api_key: str | None) -> FastMCP:
-    mcp: FastMCP = FastMCP("rcm")
+    mcp: FastMCP = FastMCP(
+        "rcm",
+        version=__version__,
+        experimental_capabilities=RCM_EXPERIMENTAL_CAPABILITIES,
+    )
     if api_key is not None:
         mcp.add_middleware(ApiKeyAuth(api_key))
     _register_command_tools(mcp, cfg, store)

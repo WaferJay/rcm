@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import base64
+import hashlib
 import sys
 from pathlib import Path
 
@@ -134,10 +134,13 @@ async def test_run_command_success_writes_files(tmp_path: Path) -> None:
     )
     assert result["returncode"] == 0
     assert result["timed_out"] is False
-    assert result["stdout_bytes"] == 2
-    assert result["stderr_bytes"] == 3
-    assert result["stdout_url"].startswith("https://example.test/runs/")
-    assert result["stdout_url"].endswith("/stdout")
+    assert result["schema"] == "rcm.run-result/v2"
+    assert result["stdout"]["bytes"] == 2
+    assert result["stderr"]["bytes"] == 3
+    assert result["stdout"]["sha256"] == hashlib.sha256(b"hi").hexdigest()
+    assert result["stderr"]["sha256"] == hashlib.sha256(b"err").hexdigest()
+    assert result["stdout"]["uri"].startswith("https://example.test/runs/")
+    assert result["stdout"]["uri"].endswith("/stdout")
 
     rid = result["run_id"]
     assert (store.run_dir(rid) / "stdout.log").read_text() == "hi"
@@ -147,10 +150,7 @@ async def test_run_command_success_writes_files(tmp_path: Path) -> None:
     assert meta["returncode"] == 0
 
 
-async def test_run_command_inline_artifact_mode_returns_base64(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("RCM_MCP_PROXY_ARTIFACTS", "inline-base64")
+async def test_run_command_returns_binary_safe_v2_artifacts(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     spec = make_spec(
         "binary",
@@ -163,11 +163,12 @@ async def test_run_command_inline_artifact_mode_returns_base64(
     result = await run_command(
         spec, {}, store=store, default_timeout=10, default_cwd=None
     )
-    assert result["artifact_protocol"] == "rcm-inline-base64-v1"
-    assert base64.b64decode(result["stdout_base64"]) == b"\x00\xff"
-    assert base64.b64decode(result["stderr_base64"]) == b"err"
-    assert "stdout_url" not in result
-    assert "stderr_url" not in result
+    assert result["schema"] == "rcm.run-result/v2"
+    assert result["stdout"]["bytes"] == 2
+    assert result["stdout"]["sha256"] == hashlib.sha256(b"\x00\xff").hexdigest()
+    assert result["stderr"]["bytes"] == 3
+    assert "artifact_protocol" not in result
+    assert "stdout_base64" not in result
 
 
 async def test_run_command_substitutes_params(tmp_path: Path) -> None:
@@ -210,7 +211,7 @@ async def test_run_command_missing_executable(tmp_path: Path) -> None:
     rid = result["run_id"]
     err = (store.run_dir(rid) / "stderr.log").read_text()
     assert "executable not found" in err
-    assert result["stderr_bytes"] == len(err.encode())
+    assert result["stderr"]["bytes"] == len(err.encode())
 
 
 async def test_run_command_pattern_rejection_does_not_create_run(tmp_path: Path) -> None:

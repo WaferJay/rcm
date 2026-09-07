@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import os
 import re
 import string
 import time
 from datetime import datetime, timezone
 from typing import Any
 
+from .artifacts import public_run_result, sha256_file
 from .config import CommandSpec, ParamSpec
-from .artifacts import ARTIFACT_ENV, ARTIFACT_ENV_VALUE, ARTIFACT_PROTOCOL
 from .store import Store
 
 
@@ -124,6 +122,7 @@ async def run_command(
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=out_f,
                 stderr=err_f,
                 cwd=cwd,
@@ -173,8 +172,9 @@ async def run_command(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    store.write_meta(run_id, meta)
-    return _public_result(meta, store)
+    result = _public_result(meta, store)
+    store.write_meta(run_id, {**meta, **result})
+    return result
 
 
 def _build_meta(
@@ -201,8 +201,14 @@ def _build_meta(
         "duration_ms": duration_ms,
         "returncode": returncode,
         "timed_out": timed_out,
-        "stdout_bytes": _safe_size(stdout_path),
-        "stderr_bytes": _safe_size(stderr_path),
+        "stdout": {
+            "bytes": _safe_size(stdout_path),
+            "sha256": sha256_file(stdout_path),
+        },
+        "stderr": {
+            "bytes": _safe_size(stderr_path),
+            "sha256": sha256_file(stderr_path),
+        },
     }
 
 
@@ -215,24 +221,15 @@ def _safe_size(path) -> int:
 
 def _public_result(meta: dict[str, Any], store: Store) -> dict[str, Any]:
     run_id = meta["run_id"]
-    result = {
-        "run_id": run_id,
-        "returncode": meta["returncode"],
-        "timed_out": meta["timed_out"],
-        "duration_ms": meta["duration_ms"],
-        "stdout_bytes": meta["stdout_bytes"],
-        "stderr_bytes": meta["stderr_bytes"],
-        "stdout_url": store.url_for(run_id, "stdout"),
-        "stderr_url": store.url_for(run_id, "stderr"),
-    }
-    if os.environ.get(ARTIFACT_ENV) == ARTIFACT_ENV_VALUE:
-        result["artifact_protocol"] = ARTIFACT_PROTOCOL
-        result["stdout_base64"] = base64.b64encode(
-            store.file_path(run_id, "stdout").read_bytes()
-        ).decode("ascii")
-        result["stderr_base64"] = base64.b64encode(
-            store.file_path(run_id, "stderr").read_bytes()
-        ).decode("ascii")
-        result.pop("stdout_url")
-        result.pop("stderr_url")
-    return result
+    return public_run_result(
+        run_id=run_id,
+        returncode=meta["returncode"],
+        timed_out=meta["timed_out"],
+        duration_ms=meta["duration_ms"],
+        stdout_uri=store.url_for(run_id, "stdout"),
+        stdout_bytes=meta["stdout"]["bytes"],
+        stdout_sha256=meta["stdout"]["sha256"],
+        stderr_uri=store.url_for(run_id, "stderr"),
+        stderr_bytes=meta["stderr"]["bytes"],
+        stderr_sha256=meta["stderr"]["sha256"],
+    )

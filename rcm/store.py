@@ -46,6 +46,34 @@ class Store:
         d.mkdir(parents=True, exist_ok=False)
         return run_id, d
 
+    def create_staging_run(self) -> tuple[str, Path]:
+        """Create an unpublished run directory for atomic proxy localization."""
+        while True:
+            run_id = self.new_run_id()
+            staging = self.runs_dir / f".{run_id}.tmp"
+            try:
+                staging.mkdir(parents=False, exist_ok=False)
+            except FileExistsError:
+                continue
+            return run_id, staging
+
+    def commit_staging_run(
+        self, run_id: str, staging: Path, meta: dict
+    ) -> Path:
+        """Write metadata and atomically publish a staged run."""
+        expected = self.runs_dir / f".{run_id}.tmp"
+        if staging != expected or not staging.is_dir():
+            raise StoreError("invalid staging run")
+        meta_path = staging / "meta.json"
+        tmp = staging / "meta.json.tmp"
+        tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(meta_path)
+        destination = self.run_dir(run_id)
+        if destination.exists():
+            raise StoreError("run_id already exists")
+        staging.replace(destination)
+        return destination
+
     def file_path(self, run_id: str, stream: Stream) -> Path:
         d = self.run_dir(run_id)
         if stream == "stdout":
@@ -74,7 +102,7 @@ class Store:
             return 0
         entries = []
         for child in self.runs_dir.iterdir():
-            if not child.is_dir():
+            if not child.is_dir() or child.name.startswith("."):
                 continue
             try:
                 entries.append((child.stat().st_mtime, child))

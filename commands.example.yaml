@@ -53,6 +53,8 @@ server:
 #   remote_tools:
 #     transport: http
 #     endpoint: https://remote.example.com/mcp
+#     # For an RCM v2 target only; omit to download into this RCM's run store.
+#     artifacts: passthrough
 #     headers:
 #       Authorization:
 #         env: REMOTE_MCP_AUTH

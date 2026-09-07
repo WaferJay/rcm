@@ -5,8 +5,8 @@ named MCP tools, served over Streamable HTTP or stdio.
 
 - Each command in the YAML config becomes one named MCP tool.
 - Calling a tool runs the command with `shell=False` (no shell expansion),
-  records stdout/stderr to disk, and returns just `run_id` + exit code +
-  byte counts + absolute download URLs.
+  records stdout/stderr to disk, and returns an `rcm.run-result/v2` object with
+  a URI, byte count, and SHA-256 digest for each stream.
 - Stdout/stderr are downloaded over HTTP or HTTPS from
   `/runs/<run_id>/{stdout,stderr,meta}`. These endpoints are intentionally
   **public**; access is gated by the unguessable 256-bit `run_id`
@@ -147,6 +147,8 @@ proxy:
   reports:
     transport: http
     endpoint: https://reports.example.com/mcp
+    # Optional for an RCM v2 target. Default: localize.
+    artifacts: passthrough
     headers:
       Authorization:
         env: REPORTS_MCP_AUTH
@@ -204,15 +206,25 @@ are protected from both transfer and `--delete` and cannot be overridden.
 mappings have deletion disabled; if either overlapping mapping enables
 deletion, rcm rejects the target during startup.
 
-The proxy uses the Python `mcp-proxy` bridge for HTTP/SSE targets when
-available. SSH credentials are taken from the local OpenSSH configuration,
-agent, and keys. The local machine must provide `rsync` for synchronized
-targets and `ssh` for SSH targets.
+HTTP/SSE targets use the native MCP client transports. SSH credentials are
+taken from the local OpenSSH configuration, agent, and keys. The local machine
+must provide `rsync` for synchronized targets and `ssh` for SSH targets.
 
-When a proxy starts a stdio or SSH child, it marks the child with an internal
-rcm artifact protocol. A child rcm server returns command output as base64;
-the local proxy stores it locally and returns local `file://` URLs. Results
-from non-rcm MCP services are passed through unchanged.
+RCM servers advertise the v2 artifact capability during MCP initialization.
+For another RCM, `artifacts` defaults to `localize`: a local stdio proxy reads
+the returned `file://` URI directly, an SSH proxy streams the file over the
+same SSH host, and an HTTP proxy downloads the returned URL. The proxy verifies
+the declared size and SHA-256 of both streams, creates a new local run, and
+returns URIs appropriate for its own server transport (`file://` for stdio,
+HTTP URLs for HTTP). No command output is embedded in the MCP tool response.
+
+An HTTP RCM target can instead set `artifacts: passthrough`. Its run ID and
+HTTP artifact URLs are then returned without a local copy, even when the outer
+RCM uses stdio. `passthrough` is rejected for stdio, SSH, and SSE targets. An
+explicit `artifacts` setting also requires the target to identify itself as an
+RCM v2 server. Results from ordinary MCP services are always passed through
+unchanged. Targets discovered through `ssh` plus `config` are RCM-specific and
+therefore also require the remote server to support v2.
 
 ## HTTPS and self-signed certificates
 
@@ -271,14 +283,21 @@ A `tools/call` for `tail_log` with `{lines: 100, file: "nginx.log"}` returns:
 
 ```json
 {
+  "schema": "rcm.run-result/v2",
   "run_id": "k7Q...",
   "returncode": 0,
   "timed_out": false,
   "duration_ms": 42,
-  "stdout_bytes": 7321,
-  "stderr_bytes": 0,
-  "stdout_url": "https://rcm.example.com/runs/k7Q.../stdout",
-  "stderr_url": "https://rcm.example.com/runs/k7Q.../stderr"
+  "stdout": {
+    "uri": "https://rcm.example.com/runs/k7Q.../stdout",
+    "bytes": 7321,
+    "sha256": "..."
+  },
+  "stderr": {
+    "uri": "https://rcm.example.com/runs/k7Q.../stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
 }
 ```
 

@@ -104,7 +104,7 @@ done
 
 # Some packages check importlib.metadata for their distribution info / entry
 # points at runtime; keep that metadata in the bundle.
-for dist in fastmcp fastmcp-slim mcp mcp-proxy uvicorn starlette pydantic pydantic-core \
+for dist in fastmcp fastmcp-slim mcp uvicorn starlette pydantic pydantic-core \
             pydantic-settings opentelemetry-api anyio httpx httpcore httpx-sse \
             sse-starlette PyYAML jsonschema rich click cyclopts authlib certifi \
             python-multipart; do

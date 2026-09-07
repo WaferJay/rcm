@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
+import hashlib
+import json
 import logging
 import os
 import posixpath
+import re
 import shlex
 import shutil
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote_to_bytes, urlsplit
 
+import httpx
 import yaml
 
 from fastmcp import Client, FastMCP
@@ -26,10 +28,24 @@ from fastmcp.client.transports import (
 )
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.base import Tool, ToolResult
+from mcp.types import Implementation, TextContent
 from pydantic import PrivateAttr
 
+from . import __version__
 from .auth import ApiKeyAuth
-from .artifacts import ARTIFACT_ENV, ARTIFACT_ENV_VALUE, ARTIFACT_PROTOCOL
+from .artifacts import (
+    DEFAULT_ARTIFACT_MODE,
+    RCM_CALL_META,
+    RCM_CAPABILITY,
+    RCM_EXPERIMENTAL_CAPABILITIES,
+    RCM_PROTOCOL_VERSION,
+    RCM_RESULT_SCHEMA,
+    ArtifactDescriptor,
+    ArtifactError,
+    RunResult,
+    parse_run_result,
+    public_run_result,
+)
 from .config import (
     Config,
     HeaderSpec,
@@ -38,7 +54,7 @@ from .config import (
     SyncMappingSpec,
     SyncSpec,
 )
-from .store import Store
+from .store import Store, StoreError
 from .sync import SyncError, SyncRunner
 
 
@@ -291,41 +307,30 @@ def _resolve_headers(
     return resolved
 
 
-def _mcp_proxy_command() -> tuple[str, list[str]]:
-    executable = shutil.which("mcp-proxy")
-    if executable is not None:
-        return executable, []
-    raise ProxyError(
-        "mcp-proxy executable was not found; install the mcp-proxy dependency "
-        "or use the native MCP HTTP/SSE fallback"
-    )
-
-
 def _build_transport(target: ProxyTargetSpec):
     if target.transport == "stdio":
         assert target.command is not None
-        child_env = dict(os.environ)
-        child_env[ARTIFACT_ENV] = ARTIFACT_ENV_VALUE
         return StdioTransport(
             command=target.command[0],
             args=target.command[1:],
             cwd=target.cwd,
-            env=child_env,
+            env=dict(os.environ),
         )
 
     if target.transport == "ssh":
         assert target.ssh is not None
         if target.ssh.command is None:
             raise ProxyError(f"proxy target {target.name!r} has no SSH command")
-        env_args = [f"{ARTIFACT_ENV}={ARTIFACT_ENV_VALUE}"]
+        remote_args: list[str] = []
         if target.remote_config is not None:
-            env_args.append(f"RCM_CONFIG={shlex.quote(target.remote_config.path)}")
+            remote_args.extend(
+                ["env", f"RCM_CONFIG={shlex.quote(target.remote_config.path)}"]
+            )
         return StdioTransport(
             command="ssh",
             args=[
                 target.ssh.host,
-                "env",
-                *env_args,
+                *remote_args,
                 *target.ssh.command,
             ],
         )
@@ -333,25 +338,200 @@ def _build_transport(target: ProxyTargetSpec):
     assert target.endpoint is not None
     headers = _resolve_headers(target)
     if target.transport == "http":
-        proxy_transport = "streamablehttp"
-    else:
-        proxy_transport = "sse"
+        return StreamableHttpTransport(target.endpoint, headers=headers)
+    return SSETransport(target.endpoint, headers=headers)
 
+
+def _supports_rcm_v2(client: Client) -> bool:
+    initialized = client.initialize_result
+    if initialized is None:
+        return False
+    experimental = initialized.capabilities.experimental or {}
+    capability = experimental.get(RCM_CAPABILITY)
+    if not isinstance(capability, dict):
+        return False
+    versions = capability.get("versions")
+    return isinstance(versions, list) and RCM_PROTOCOL_VERSION in versions
+
+
+def _file_path_from_uri(uri: str) -> str:
     try:
-        command, prefix = _mcp_proxy_command()
-    except ProxyError:
-        # Keep the compiled binary usable when its environment does not ship
-        # the optional console-script wrapper. The MCP SDK still provides the
-        # same two client transports.
-        if target.transport == "http":
-            return StreamableHttpTransport(target.endpoint, headers=headers)
-        return SSETransport(target.endpoint, headers=headers)
+        parsed = urlsplit(uri)
+    except ValueError as exc:
+        raise ArtifactError("artifact has an invalid file URI") from exc
+    if parsed.scheme.lower() != "file":
+        raise ArtifactError("artifact URI is not a file URI")
+    if parsed.netloc or parsed.query or parsed.fragment:
+        raise ArtifactError("file artifact URI cannot contain a host, query, or fragment")
+    if re.search(r"%(?![0-9A-Fa-f]{2})", parsed.path):
+        raise ArtifactError("file artifact URI contains invalid percent encoding")
+    raw_path = unquote_to_bytes(parsed.path)
+    if b"\x00" in raw_path:
+        raise ArtifactError("file artifact URI contains a NUL byte")
+    path = os.fsdecode(raw_path)
+    if not Path(path).is_absolute():
+        raise ArtifactError("file artifact URI must contain an absolute path")
+    return path
 
-    args = [*prefix, "--transport", proxy_transport]
-    for name, value in headers.items():
-        args.extend(["--headers", name, value])
-    args.append(target.endpoint)
-    return StdioTransport(command=command, args=args)
+
+def _validate_transfer(
+    descriptor: ArtifactDescriptor, size: int, digest: str
+) -> None:
+    if size != descriptor.bytes:
+        raise ArtifactError(
+            f"artifact size mismatch: expected {descriptor.bytes}, received {size}"
+        )
+    if digest != descriptor.sha256:
+        raise ArtifactError("artifact SHA-256 mismatch")
+
+
+def _copy_local_file(
+    source: str, destination: Path, descriptor: ArtifactDescriptor
+) -> None:
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        source_stream = open(source, "rb")
+    except OSError as exc:
+        raise ArtifactError(f"failed to open local artifact {source!r}: {exc}") from exc
+    with source_stream, destination.open("wb") as output:
+        while chunk := source_stream.read(1024 * 1024):
+            size += len(chunk)
+            if size > descriptor.bytes:
+                raise ArtifactError(
+                    f"artifact exceeds declared size of {descriptor.bytes} bytes"
+                )
+            digest.update(chunk)
+            output.write(chunk)
+    _validate_transfer(descriptor, size, digest.hexdigest())
+
+
+async def _read_ssh_diagnostics(stream: asyncio.StreamReader) -> bytes:
+    captured = bytearray()
+    while chunk := await stream.read(64 * 1024):
+        remaining = (64 * 1024) - len(captured)
+        if remaining > 0:
+            captured.extend(chunk[:remaining])
+    return bytes(captured)
+
+
+async def _copy_ssh_file(
+    host: str,
+    source: str,
+    destination: Path,
+    descriptor: ArtifactDescriptor,
+) -> None:
+    command = f"cat -- {shlex.quote(source)}"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ssh",
+            host,
+            command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise ArtifactError(
+            f"failed to execute ssh for artifact on {host!r}: {exc}"
+        ) from exc
+
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    diagnostics_task = asyncio.create_task(_read_ssh_diagnostics(proc.stderr))
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := await proc.stdout.read(1024 * 1024):
+                size += len(chunk)
+                if size > descriptor.bytes:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    raise ArtifactError(
+                        f"artifact exceeds declared size of {descriptor.bytes} bytes"
+                    )
+                digest.update(chunk)
+                output.write(chunk)
+        returncode = await proc.wait()
+        diagnostics = await diagnostics_task
+    except BaseException:
+        if not diagnostics_task.done():
+            diagnostics_task.cancel()
+        try:
+            await diagnostics_task
+        except BaseException:
+            pass
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except BaseException:
+            pass
+        raise
+
+    if returncode != 0:
+        detail = diagnostics.decode(errors="replace").strip()
+        suffix = f": {detail}" if detail else ""
+        raise ArtifactError(
+            f"failed to read remote artifact {source!r} from {host!r} "
+            f"(exit code {returncode}){suffix}"
+        )
+    _validate_transfer(descriptor, size, digest.hexdigest())
+
+
+async def _copy_http_file(
+    destination: Path,
+    descriptor: ArtifactDescriptor,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> None:
+    try:
+        parsed = urlsplit(descriptor.uri)
+    except ValueError as exc:
+        raise ArtifactError("HTTP artifact URI is invalid") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ArtifactError("HTTP artifact URI must be an absolute http:// or https:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ArtifactError("HTTP artifact URI cannot contain user information")
+
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            max_redirects=5,
+            timeout=httpx.Timeout(30.0),
+            transport=transport,
+        ) as client:
+            async with client.stream(
+                "GET", descriptor.uri, headers={"Accept-Encoding": "identity"}
+            ) as response:
+                if response.status_code < 200 or response.status_code >= 300:
+                    raise ArtifactError(
+                        f"artifact download returned HTTP {response.status_code}"
+                    )
+                if response.url.scheme.lower() not in {"http", "https"}:
+                    raise ArtifactError("artifact redirect used a non-HTTP URL")
+                with destination.open("wb") as output:
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > descriptor.bytes:
+                            raise ArtifactError(
+                                "artifact exceeds declared size of "
+                                f"{descriptor.bytes} bytes"
+                            )
+                        digest.update(chunk)
+                        output.write(chunk)
+    except ArtifactError:
+        raise
+    except httpx.HTTPError as exc:
+        raise ArtifactError(f"artifact download failed: {exc}") from exc
+    _validate_transfer(descriptor, size, digest.hexdigest())
 
 
 class ProxyTool(Tool):
@@ -362,6 +542,10 @@ class ProxyTool(Tool):
     _client: Client = PrivateAttr()
     _sync_runner: SyncRunner | None = PrivateAttr()
     _store: Store | None = PrivateAttr()
+    _target_transport: str = PrivateAttr()
+    _ssh_host: str | None = PrivateAttr()
+    _artifact_mode: str = PrivateAttr()
+    _rcm_peer: bool = PrivateAttr()
 
     def __init__(
         self,
@@ -375,6 +559,10 @@ class ProxyTool(Tool):
         client: Client,
         sync: SyncRunner | None,
         store: Store | None = None,
+        target_transport: str = "stdio",
+        ssh_host: str | None = None,
+        artifact_mode: str = DEFAULT_ARTIFACT_MODE,
+        rcm_peer: bool = False,
     ) -> None:
         super().__init__(
             name=public_name,
@@ -387,6 +575,10 @@ class ProxyTool(Tool):
         self._client = client
         self._sync_runner = sync
         self._store = store
+        self._target_transport = target_transport
+        self._ssh_host = ssh_host
+        self._artifact_mode = artifact_mode
+        self._rcm_peer = rcm_peer
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         if self._sync_runner is not None:
@@ -396,9 +588,11 @@ class ProxyTool(Tool):
                 raise ToolError(str(exc)) from exc
 
         try:
+            call_kwargs: dict[str, Any] = {}
+            if self._rcm_peer:
+                call_kwargs["meta"] = RCM_CALL_META
             result = await self._client.call_tool_mcp(
-                self._remote_name,
-                arguments or {},
+                self._remote_name, arguments or {}, **call_kwargs
             )
         except Exception as exc:
             raise ToolError(
@@ -409,56 +603,113 @@ class ProxyTool(Tool):
         structured_content = getattr(result, "structured_content", None)
         if structured_content is None:
             structured_content = getattr(result, "structuredContent", None)
-        if isinstance(structured_content, dict) and (
-            structured_content.get("artifact_protocol") == ARTIFACT_PROTOCOL
+        rewritten = False
+        if (
+            self._rcm_peer
+            and isinstance(structured_content, dict)
+            and structured_content.get("schema") == RCM_RESULT_SCHEMA
         ):
             try:
-                structured_content = self._materialize_artifact(structured_content)
-            except (ArtifactError, OSError) as exc:
+                remote = parse_run_result(structured_content)
+                if self._artifact_mode == "passthrough":
+                    self._validate_passthrough(remote)
+                else:
+                    structured_content = await self._materialize_artifact(remote)
+                rewritten = True
+            except (ArtifactError, OSError, StoreError) as exc:
                 raise ToolError(str(exc)) from exc
 
         return ToolResult(
-            content=result.content,
+            content=(
+                [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(structured_content, ensure_ascii=False),
+                    )
+                ]
+                if rewritten
+                else result.content
+            ),
             structured_content=structured_content,
             meta=getattr(result, "meta", None),
             is_error=getattr(result, "is_error", getattr(result, "isError", False)),
         )
 
-    def _materialize_artifact(self, remote: dict[str, Any]) -> dict[str, Any]:
+    def _validate_passthrough(self, remote: RunResult) -> None:
+        if self._target_transport != "http":
+            raise ArtifactError("artifact passthrough requires an HTTP RCM target")
+        for descriptor in (remote.stdout, remote.stderr):
+            try:
+                parsed = urlsplit(descriptor.uri)
+            except ValueError as exc:
+                raise ArtifactError("artifact passthrough URL is invalid") from exc
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+                raise ArtifactError(
+                    "artifact passthrough requires absolute HTTP stdout/stderr URLs"
+                )
+            if parsed.username is not None or parsed.password is not None:
+                raise ArtifactError(
+                    "artifact passthrough URLs cannot contain user information"
+                )
+
+    async def _copy_artifact(
+        self, descriptor: ArtifactDescriptor, destination: Path
+    ) -> None:
+        try:
+            scheme = urlsplit(descriptor.uri).scheme.lower()
+        except ValueError as exc:
+            raise ArtifactError("artifact URI is invalid") from exc
+        if scheme in {"http", "https"}:
+            await _copy_http_file(destination, descriptor)
+            return
+        if scheme != "file":
+            raise ArtifactError(f"unsupported artifact URI scheme {scheme!r}")
+
+        source = _file_path_from_uri(descriptor.uri)
+        if self._target_transport == "stdio":
+            await asyncio.to_thread(_copy_local_file, source, destination, descriptor)
+            return
+        if self._target_transport == "ssh":
+            if self._ssh_host is None:
+                raise ArtifactError("SSH artifact received without an SSH host")
+            await _copy_ssh_file(self._ssh_host, source, destination, descriptor)
+            return
+        raise ArtifactError(
+            f"{self._target_transport} RCM target returned an inaccessible file URI"
+        )
+
+    async def _materialize_artifact(self, remote: RunResult) -> dict[str, Any]:
         if self._store is None:
             raise ArtifactError("rcm artifact received without a local store")
-
-        stdout_raw = remote.get("stdout_base64")
-        stderr_raw = remote.get("stderr_base64")
-        if not isinstance(stdout_raw, str) or not isinstance(stderr_raw, str):
-            raise ArtifactError("rcm artifact is missing base64 output fields")
+        run_id, staging = self._store.create_staging_run()
         try:
-            stdout = base64.b64decode(stdout_raw, validate=True)
-            stderr = base64.b64decode(stderr_raw, validate=True)
-        except (ValueError, binascii.Error) as exc:
-            raise ArtifactError("rcm artifact contains invalid base64 output") from exc
-
-        run_id, _ = self._store.create_run()
-        self._store.file_path(run_id, "stdout").write_bytes(stdout)
-        self._store.file_path(run_id, "stderr").write_bytes(stderr)
-
-        local = dict(remote)
-        local.pop("artifact_protocol", None)
-        local.pop("stdout_base64", None)
-        local.pop("stderr_base64", None)
-        local.pop("stdout_url", None)
-        local.pop("stderr_url", None)
-        local["run_id"] = run_id
-        local["stdout_bytes"] = len(stdout)
-        local["stderr_bytes"] = len(stderr)
-        local["stdout_url"] = self._store.url_for(run_id, "stdout")
-        local["stderr_url"] = self._store.url_for(run_id, "stderr")
-        self._store.write_meta(run_id, local)
-        return local
-
-
-class ArtifactError(RuntimeError):
-    """Raised when an rcm artifact cannot be recovered locally."""
+            await self._copy_artifact(remote.stdout, staging / "stdout.log")
+            await self._copy_artifact(remote.stderr, staging / "stderr.log")
+            local = public_run_result(
+                run_id=run_id,
+                returncode=remote.returncode,
+                timed_out=remote.timed_out,
+                duration_ms=remote.duration_ms,
+                stdout_uri=self._store.url_for(run_id, "stdout"),
+                stdout_bytes=remote.stdout.bytes,
+                stdout_sha256=remote.stdout.sha256,
+                stderr_uri=self._store.url_for(run_id, "stderr"),
+                stderr_bytes=remote.stderr.bytes,
+                stderr_sha256=remote.stderr.sha256,
+            )
+            meta = {
+                **local,
+                "upstream": {
+                    "target": self._target_name,
+                    "run_id": remote.run_id,
+                    "transport": self._target_transport,
+                },
+            }
+            self._store.commit_staging_run(run_id, staging, meta)
+            return local
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
 
 
 class ProxyRuntime:
@@ -478,7 +729,11 @@ class ProxyRuntime:
         if cfg.proxy is None:
             raise ProxyError("proxy configuration is missing")
 
-        server = FastMCP("rcm")
+        server = FastMCP(
+            "rcm",
+            version=__version__,
+            experimental_capabilities=RCM_EXPERIMENTAL_CAPABILITIES,
+        )
         if api_key is not None:
             server.add_middleware(ApiKeyAuth(api_key))
         stack = AsyncExitStack()
@@ -489,6 +744,14 @@ class ProxyRuntime:
                     if configured_target.remote_config is not None
                     else configured_target
                 )
+                if (
+                    target.artifacts == "passthrough"
+                    and target.transport != "http"
+                ):
+                    raise ProxyError(
+                        f"proxy target {target.name!r}: artifact passthrough "
+                        "requires an HTTP RCM target"
+                    )
                 try:
                     sync_runner = (
                         SyncRunner(
@@ -511,8 +774,21 @@ class ProxyRuntime:
                     Client(
                         _build_transport(target),
                         name=f"rcm-proxy-{target.name}",
+                        client_info=Implementation(name="rcm", version=__version__),
                     )
                 )
+                rcm_peer = _supports_rcm_v2(client)
+                if configured_target.remote_config is not None and not rcm_peer:
+                    raise ProxyError(
+                        f"remote-config target {target.name!r} does not support "
+                        "the RCM artifact protocol v2"
+                    )
+                if target.artifacts is not None and not rcm_peer:
+                    raise ProxyError(
+                        f"proxy target {target.name!r} configures artifacts but "
+                        "the target is not an RCM v2 server"
+                    )
+                artifact_mode = target.artifacts or DEFAULT_ARTIFACT_MODE
                 remote_tools = await client.list_tools()
                 for remote_tool in remote_tools:
                     remote_name = remote_tool.name
@@ -534,6 +810,10 @@ class ProxyRuntime:
                             client=client,
                             sync=sync_runner,
                             store=store,
+                            target_transport=target.transport,
+                            ssh_host=(target.ssh.host if target.ssh is not None else None),
+                            artifact_mode=artifact_mode,
+                            rcm_peer=rcm_peer,
                         )
                     )
         except Exception:

@@ -129,6 +129,16 @@ async def test_list_tools_with_valid_key(running_server) -> None:
     assert "w" in (arg_tool.inputSchema or {}).get("properties", {})
 
 
+async def test_server_advertises_rcm_v2_without_internal_tools(running_server) -> None:
+    client = make_client(running_server["url"], "testkey")
+    async with client:
+        tools = await client.list_tools()
+        initialized = client.initialize_result
+    assert initialized is not None
+    assert initialized.capabilities.experimental["rcm.artifacts"]["versions"] == [2]
+    assert {tool.name for tool in tools} == {"echo_hi", "echo_arg"}
+
+
 async def test_list_tools_without_key_rejected(running_server) -> None:
     client = make_client(running_server["url"], None)
     with pytest.raises(Exception):
@@ -151,9 +161,10 @@ async def test_call_tool_returns_capability_urls(running_server) -> None:
     assert data["returncode"] == 0
     assert data["timed_out"] is False
     base = running_server["url"]
-    assert data["stdout_url"].startswith(f"{base}/runs/")
-    assert data["stdout_url"].endswith("/stdout")
-    assert data["stderr_url"].endswith("/stderr")
+    assert data["schema"] == "rcm.run-result/v2"
+    assert data["stdout"]["uri"].startswith(f"{base}/runs/")
+    assert data["stdout"]["uri"].endswith("/stdout")
+    assert data["stderr"]["uri"].endswith("/stderr")
 
 
 async def test_call_tool_param_validation(running_server) -> None:
@@ -201,9 +212,9 @@ async def test_stdio_server_returns_local_file_urls(tmp_path: Path) -> None:
         result = await client.call_tool("binary_output", {})
 
     data = result.data
-    stdout_path = Path(urlparse(data["stdout_url"]).path)
-    stderr_path = Path(urlparse(data["stderr_url"]).path)
-    assert data["stdout_url"].startswith("file://")
+    stdout_path = Path(urlparse(data["stdout"]["uri"]).path)
+    stderr_path = Path(urlparse(data["stderr"]["uri"]).path)
+    assert data["stdout"]["uri"].startswith("file://")
     assert stdout_path.read_bytes() == b"\x00\xff"
     assert stderr_path.read_bytes() == b""
 

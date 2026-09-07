@@ -295,6 +295,7 @@ def test_load_proxy_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
               tools:
                 transport: http
                 endpoint: https://example.com/mcp
+                artifacts: passthrough
                 headers:
                   Authorization: {env: REMOTE_MCP_AUTH}
                   X-Project: {value: compile}
@@ -317,6 +318,8 @@ def test_load_proxy_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert mapping.delete is False
     assert http_target.headers["Authorization"].env == "REMOTE_MCP_AUTH"
     assert http_target.headers["X-Project"].value == "compile"
+    assert http_target.artifacts == "passthrough"
+    assert compile_target.artifacts is None
 
 
 def test_load_multi_mapping_sync_config(tmp_path: Path) -> None:
@@ -403,6 +406,7 @@ def test_load_remote_config_proxy_target(tmp_path: Path) -> None:
                 ssh:
                   host: compile-machine
                 config: /etc/rcm/commands.yaml
+                artifacts: passthrough
                 sync:
                   enabled: false
             """,
@@ -416,6 +420,7 @@ def test_load_remote_config_proxy_target(tmp_path: Path) -> None:
     assert target.ssh.command is None
     assert target.sync is not None
     assert target.sync.enabled is False
+    assert target.artifacts == "passthrough"
 
 
 @pytest.mark.parametrize(
@@ -650,6 +655,28 @@ def test_webdav_config_rejected(tmp_path: Path) -> None:
                 transport: http
             """,
             "endpoint is required",
+        ),
+        (
+            """
+            proxy:
+              target:
+                transport: http
+                endpoint: https://example.com/mcp
+                artifacts: copy
+            """,
+            "artifacts must be one of",
+        ),
+        (
+            """
+            proxy:
+              target:
+                transport: ssh
+                ssh:
+                  host: compile-machine
+                  command: [rcm, --stdio]
+                artifacts: passthrough
+            """,
+            "passthrough requires an HTTP RCM target",
         ),
     ],
 )

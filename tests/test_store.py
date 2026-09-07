@@ -71,6 +71,20 @@ def test_write_meta_atomic(tmp_path: Path) -> None:
     assert not (s.run_dir(rid) / "meta.json.tmp").exists()
 
 
+def test_staging_run_is_published_with_metadata_atomically(tmp_path: Path) -> None:
+    s = Store(tmp_path, public_base_url="http://x")
+    rid, staging = s.create_staging_run()
+    (staging / "stdout.log").write_bytes(b"out")
+    (staging / "stderr.log").write_bytes(b"")
+
+    destination = s.commit_staging_run(rid, staging, {"run_id": rid})
+
+    assert not staging.exists()
+    assert destination == s.run_dir(rid)
+    assert s.file_path(rid, "stdout").read_bytes() == b"out"
+    assert json.loads(s.file_path(rid, "meta").read_text()) == {"run_id": rid}
+
+
 def test_prune_keeps_newest(tmp_path: Path) -> None:
     s = Store(tmp_path, public_base_url="http://x")
     created = []

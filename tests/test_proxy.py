@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import base64
+import hashlib
+import json
 import socket
 from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
+import httpx
 from fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent
 
@@ -26,16 +28,21 @@ from rcm.config import (
     SyncMappingSpec,
     SyncSpec,
 )
+from rcm.artifacts import ArtifactDescriptor
 from rcm.proxy import (
+    ProxyError,
     ProxyTool,
     RemoteServerMetadata,
     _discover_remote_stdio_command,
+    _copy_http_file,
+    _copy_ssh_file,
+    _file_path_from_uri,
     _read_remote_metadata,
     _remote_sync_spec,
     _resolve_remote_target,
     _ssh_command,
 )
-from rcm.server import build_proxy_server
+from rcm.server import build_proxy_server, build_server
 from rcm.store import Store
 from rcm.sync import SyncError
 
@@ -136,27 +143,43 @@ async def test_proxy_tool_blocks_call_when_sync_fails() -> None:
 
 
 @pytest.mark.asyncio
-async def test_proxy_tool_materializes_rcm_inline_artifact(tmp_path) -> None:
+async def test_proxy_tool_localizes_stdio_rcm_files(tmp_path) -> None:
     stdout = b"\x00remote\xff\n"
     stderr = b"warning\n"
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    stdout_path = upstream / "stdout.log"
+    stderr_path = upstream / "stderr.log"
+    stdout_path.write_bytes(stdout)
+    stderr_path.write_bytes(stderr)
 
     class ArtifactClient:
-        async def call_tool_mcp(self, name: str, arguments: dict) -> CallToolResult:
+        async def call_tool_mcp(
+            self, name: str, arguments: dict, *, meta: dict
+        ) -> CallToolResult:
+            assert meta == {"rcm": {"artifacts": {"version": 2}}}
             return CallToolResult(
                 content=[],
                 structuredContent={
-                    "artifact_protocol": "rcm-inline-base64-v1",
+                    "schema": "rcm.run-result/v2",
                     "run_id": "remote-run",
                     "returncode": 0,
                     "timed_out": False,
-                    "stdout_bytes": len(stdout),
-                    "stderr_bytes": len(stderr),
-                    "stdout_base64": base64.b64encode(stdout).decode("ascii"),
-                    "stderr_base64": base64.b64encode(stderr).decode("ascii"),
+                    "duration_ms": 12,
+                    "stdout": {
+                        "uri": stdout_path.as_uri(),
+                        "bytes": len(stdout),
+                        "sha256": hashlib.sha256(stdout).hexdigest(),
+                    },
+                    "stderr": {
+                        "uri": stderr_path.as_uri(),
+                        "bytes": len(stderr),
+                        "sha256": hashlib.sha256(stderr).hexdigest(),
+                    },
                 },
             )
 
-    store = Store(tmp_path / "runs", (tmp_path / "runs").as_uri(), local_urls=True)
+    store = Store(tmp_path / "runs", "https://outer.example", local_urls=False)
     tool = ProxyTool(
         public_name="remote__build",
         target_name="remote",
@@ -167,18 +190,237 @@ async def test_proxy_tool_materializes_rcm_inline_artifact(tmp_path) -> None:
         client=ArtifactClient(),
         sync=None,
         store=store,
+        target_transport="stdio",
+        rcm_peer=True,
     )
 
     result = await tool.run({})
     data = result.structured_content
     assert data["run_id"] != "remote-run"
-    assert data["stdout_url"].startswith("file://")
-    assert data["stderr_url"].startswith("file://")
-    assert "stdout_base64" not in data
-    assert "stderr_base64" not in data
-    assert "artifact_protocol" not in data
-    assert Path(urlparse(data["stdout_url"]).path).read_bytes() == stdout
-    assert Path(urlparse(data["stderr_url"]).path).read_bytes() == stderr
+    assert data["schema"] == "rcm.run-result/v2"
+    assert data["stdout"]["uri"].startswith("https://outer.example/runs/")
+    assert data["stderr"]["uri"].startswith("https://outer.example/runs/")
+    assert store.file_path(data["run_id"], "stdout").read_bytes() == stdout
+    assert store.file_path(data["run_id"], "stderr").read_bytes() == stderr
+    assert json.loads(result.content[0].text) == data
+
+
+@pytest.mark.asyncio
+async def test_http_artifact_downloads_without_mcp_authorization(tmp_path) -> None:
+    payload = b"remote over http\x00"
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert "authorization" not in request.headers
+        assert request.headers["accept-encoding"] == "identity"
+        return httpx.Response(200, content=payload)
+
+    descriptor = ArtifactDescriptor(
+        uri="https://remote.example/runs/id/stdout",
+        bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    destination = tmp_path / "stdout.log"
+
+    await _copy_http_file(
+        destination, descriptor, transport=httpx.MockTransport(handle)
+    )
+
+    assert destination.read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "file://other-host/var/run/stdout.log",
+        "file:relative.log",
+        "file:///var/run/stdout.log?tail=1",
+        "file:///var/run/bad%ZZ.log",
+        "file:///var/run/nul%00.log",
+    ],
+)
+def test_file_artifact_uri_validation(uri: str) -> None:
+    with pytest.raises(Exception):
+        _file_path_from_uri(uri)
+
+
+@pytest.mark.asyncio
+async def test_ssh_artifact_streams_binary_output_separately_from_diagnostics(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"\x00remote\xff"
+    captured: dict = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_data(payload)
+            self.stdout.feed_eof()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_data(b"ssh diagnostic that is not artifact data")
+            self.stderr.feed_eof()
+
+        async def wait(self) -> int:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    descriptor = ArtifactDescriptor(
+        uri="file:///srv/rcm/run%20files/stdout.log",
+        bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    destination = tmp_path / "stdout.log"
+
+    await _copy_ssh_file(
+        "compile-machine",
+        _file_path_from_uri(descriptor.uri),
+        destination,
+        descriptor,
+    )
+
+    assert destination.read_bytes() == payload
+    assert captured["args"] == (
+        "ssh",
+        "compile-machine",
+        "cat -- '/srv/rcm/run files/stdout.log'",
+    )
+    assert captured["kwargs"]["stdin"] is asyncio.subprocess.DEVNULL
+
+
+@pytest.mark.asyncio
+async def test_http_rcm_passthrough_keeps_remote_result(tmp_path) -> None:
+    remote = {
+        "schema": "rcm.run-result/v2",
+        "run_id": "remote-run",
+        "returncode": 0,
+        "timed_out": False,
+        "duration_ms": 8,
+        "stdout": {
+            "uri": "https://remote.example/runs/remote-run/stdout",
+            "bytes": 3,
+            "sha256": hashlib.sha256(b"out").hexdigest(),
+        },
+        "stderr": {
+            "uri": "https://remote.example/runs/remote-run/stderr",
+            "bytes": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+        },
+    }
+
+    class RcmClient:
+        async def call_tool_mcp(self, name, arguments, *, meta):
+            return CallToolResult(
+                content=[TextContent(type="text", text="stale")],
+                structuredContent=remote,
+            )
+
+    store = Store(tmp_path / "runs", "https://local.example", local_urls=False)
+    tool = ProxyTool(
+        public_name="reports__build",
+        target_name="reports",
+        remote_name="build",
+        description=None,
+        parameters={"type": "object", "properties": {}},
+        output_schema=None,
+        client=RcmClient(),
+        sync=None,
+        store=store,
+        target_transport="http",
+        artifact_mode="passthrough",
+        rcm_peer=True,
+    )
+
+    result = await tool.run({})
+
+    assert result.structured_content == remote
+    assert json.loads(result.content[0].text) == remote
+    assert list(store.runs_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_generic_result_from_rcm_aggregator_is_unchanged() -> None:
+    original = CallToolResult(
+        content=[TextContent(type="text", text="ordinary result")],
+        structuredContent={"value": 7},
+        _meta={"remote": True},
+    )
+
+    class RcmClient:
+        async def call_tool_mcp(self, name, arguments, *, meta):
+            return original
+
+    tool = ProxyTool(
+        public_name="aggregate__ordinary",
+        target_name="aggregate",
+        remote_name="ordinary",
+        description=None,
+        parameters={"type": "object", "properties": {}},
+        output_schema=None,
+        client=RcmClient(),
+        sync=None,
+        rcm_peer=True,
+    )
+
+    result = await tool.run({})
+
+    assert result.content == original.content
+    assert result.structured_content == {"value": 7}
+    assert result.meta == {"remote": True}
+
+
+@pytest.mark.asyncio
+async def test_failed_localization_removes_staging_run(tmp_path) -> None:
+    source = tmp_path / "source.log"
+    source.write_bytes(b"actual")
+    remote = {
+        "schema": "rcm.run-result/v2",
+        "run_id": "remote-run",
+        "returncode": 0,
+        "timed_out": False,
+        "duration_ms": 1,
+        "stdout": {
+            "uri": source.as_uri(),
+            "bytes": 6,
+            "sha256": "0" * 64,
+        },
+        "stderr": {
+            "uri": source.as_uri(),
+            "bytes": 6,
+            "sha256": hashlib.sha256(b"actual").hexdigest(),
+        },
+    }
+
+    class RcmClient:
+        async def call_tool_mcp(self, name, arguments, *, meta):
+            return CallToolResult(content=[], structuredContent=remote)
+
+    store = Store(tmp_path / "runs", (tmp_path / "runs").as_uri(), local_urls=True)
+    tool = ProxyTool(
+        public_name="remote__build",
+        target_name="remote",
+        remote_name="build",
+        description=None,
+        parameters={"type": "object", "properties": {}},
+        output_schema=None,
+        client=RcmClient(),
+        sync=None,
+        store=store,
+        target_transport="stdio",
+        rcm_peer=True,
+    )
+
+    with pytest.raises(Exception, match="SHA-256 mismatch"):
+        await tool.run({})
+    assert list(store.runs_dir.iterdir()) == []
 
 
 @pytest.mark.asyncio
@@ -195,6 +437,7 @@ async def test_remote_http_config_resolves_without_stdio_discovery(
         ssh=SSHSpec(host="compile-machine"),
         remote_config=RemoteConfigSpec(path="/etc/rcm/commands.yaml"),
         headers={"X-Local": HeaderSpec(value="local")},
+        artifacts="passthrough",
     )
 
     async def fake_read(_: ProxyTargetSpec) -> RemoteServerMetadata:
@@ -222,6 +465,7 @@ async def test_remote_http_config_resolves_without_stdio_discovery(
     assert resolved.ssh is not None and resolved.ssh.command is None
     assert resolved.headers["Authorization"].value == "Bearer remote-key"
     assert resolved.headers["X-Local"].value == "local"
+    assert resolved.artifacts == "passthrough"
     assert resolved.sync is not None
     mapping = resolved.sync.mappings[0]
     assert mapping.source == str(tmp_path)
@@ -421,9 +665,46 @@ mcp.run()
         local_tool = await mcp.get_tool("local_echo")
         assert local_tool is not None
         local_result = await local_tool.run({})
-        assert local_result.structured_content["stdout_bytes"] > 0
+        assert local_result.structured_content["stdout"]["bytes"] > 0
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_artifact_mode_rejects_non_rcm_target(tmp_path) -> None:
+    import sys
+
+    remote_code = """
+from fastmcp import FastMCP
+mcp = FastMCP('ordinary-mcp')
+@mcp.tool
+def echo(value: str) -> str:
+    return value
+mcp.run()
+"""
+    cfg = Config(
+        server=ServerSpec(),
+        auth=AuthSpec(api_key=None),
+        defaults=DefaultsSpec(),
+        commands=[],
+        proxy=ProxySpec(
+            targets=[
+                ProxyTargetSpec(
+                    name="ordinary",
+                    transport="stdio",
+                    command=[sys.executable, "-c", remote_code],
+                    artifacts="localize",
+                )
+            ]
+        ),
+    )
+
+    with pytest.raises(ProxyError, match="target is not an RCM v2 server"):
+        await build_proxy_server(
+            cfg,
+            Store(tmp_path / "runs", (tmp_path / "runs").as_uri()),
+            None,
+        )
 
 
 @pytest.mark.asyncio
@@ -469,10 +750,10 @@ async def test_proxy_runtime_recovers_remote_rcm_artifact(
         assert tool is not None
         result = await tool.run({})
         data = result.structured_content
-        assert data["stdout_url"].startswith("file://")
-        assert data["stderr_url"].startswith("file://")
-        assert Path(urlparse(data["stdout_url"]).path).read_bytes() == bytes([0, 255])
-        assert Path(urlparse(data["stderr_url"]).path).read_bytes() == b"err"
+        assert data["stdout"]["uri"].startswith("file://")
+        assert data["stderr"]["uri"].startswith("file://")
+        assert Path(urlparse(data["stdout"]["uri"]).path).read_bytes() == bytes([0, 255])
+        assert Path(urlparse(data["stderr"]["uri"]).path).read_bytes() == b"err"
         assert "stdout_base64" not in data
     finally:
         await runtime.close()
@@ -538,6 +819,105 @@ async def test_proxy_runtime_bridges_streamable_http(tmp_path) -> None:
     finally:
         if runtime is not None:
             await runtime.close()
+        remote_task.cancel()
+        try:
+            await remote_task
+        except BaseException:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_http_rcm_target_localizes_or_passthroughs_artifacts(tmp_path) -> None:
+    import sys
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    base_url = f"http://127.0.0.1:{port}"
+    remote_cfg = Config(
+        server=ServerSpec(public_base_url=base_url),
+        auth=AuthSpec(api_key=None),
+        defaults=DefaultsSpec(),
+        commands=[
+            CommandSpec(
+                name="binary",
+                description="Return binary output.",
+                command=[
+                    sys.executable,
+                    "-c",
+                    "import sys;sys.stdout.buffer.write(b'out\\x00');sys.stderr.buffer.write(b'err')",
+                ],
+            )
+        ],
+    )
+    remote_store = Store(tmp_path / "remote-runs", base_url)
+    remote = build_server(remote_cfg, remote_store, api_key=None)
+    remote_task = asyncio.create_task(
+        remote.run_async(
+            transport="http",
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+    )
+    deadline = asyncio.get_running_loop().time() + 5
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                break
+        except OSError:
+            if asyncio.get_running_loop().time() > deadline:
+                raise RuntimeError("remote HTTP RCM failed to start")
+            await asyncio.sleep(0.05)
+
+    async def call_through(mode: str | None, runs_name: str):
+        target = ProxyTargetSpec(
+            name="remote",
+            transport="http",
+            endpoint=f"{base_url}/mcp",
+            artifacts=mode,
+        )
+        cfg = Config(
+            server=ServerSpec(),
+            auth=AuthSpec(api_key=None),
+            defaults=DefaultsSpec(),
+            commands=[],
+            proxy=ProxySpec(targets=[target]),
+        )
+        local_store = Store(
+            tmp_path / runs_name,
+            (tmp_path / runs_name).as_uri(),
+            local_urls=True,
+        )
+        mcp, runtime = await build_proxy_server(cfg, local_store, None)
+        try:
+            tool = await mcp.get_tool("remote__binary")
+            assert tool is not None
+            result = await tool.run({})
+            return result.structured_content, local_store
+        finally:
+            await runtime.close()
+
+    try:
+        localized, local_store = await call_through(None, "localized-runs")
+        assert localized["run_id"] not in {
+            child.name for child in remote_store.runs_dir.iterdir()
+        }
+        assert localized["stdout"]["uri"].startswith("file://")
+        assert Path(urlparse(localized["stdout"]["uri"]).path).read_bytes() == b"out\x00"
+        assert Path(urlparse(localized["stderr"]["uri"]).path).read_bytes() == b"err"
+        assert len(list(local_store.runs_dir.iterdir())) == 1
+
+        passed, passthrough_store = await call_through(
+            "passthrough", "passthrough-runs"
+        )
+        assert passed["stdout"]["uri"].startswith(f"{base_url}/runs/")
+        assert passed["run_id"] in {
+            child.name for child in remote_store.runs_dir.iterdir()
+        }
+        assert list(passthrough_store.runs_dir.iterdir()) == []
+    finally:
         remote_task.cancel()
         try:
             await remote_task

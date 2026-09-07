@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from .artifacts import ARTIFACT_MODES
+
 NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 PARAM_TYPES = {"string", "integer", "number", "boolean"}
 PROXY_TRANSPORTS = {"stdio", "ssh", "http", "sse"}
@@ -166,6 +168,7 @@ class ProxyTargetSpec:
     headers: dict[str, HeaderSpec] = field(default_factory=dict)
     sync: SyncSpec | None = None
     remote_config: RemoteConfigSpec | None = None
+    artifacts: str | None = None
 
 
 @dataclass
@@ -500,6 +503,19 @@ def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
             f"proxy.{name}.transport must be one of {sorted(PROXY_TRANSPORTS)}, got {transport!r}"
         )
 
+    artifacts = raw.get("artifacts")
+    if artifacts is not None and (
+        not isinstance(artifacts, str) or artifacts not in ARTIFACT_MODES
+    ):
+        raise ConfigError(
+            f"proxy.{name}.artifacts must be one of {sorted(ARTIFACT_MODES)}, "
+            f"got {artifacts!r}"
+        )
+    if artifacts == "passthrough" and transport not in {"http", "remote"}:
+        raise ConfigError(
+            f"proxy.{name}.artifacts passthrough requires an HTTP RCM target"
+        )
+
     command_raw = raw.get("command")
     command: list[str] | None = None
     if command_raw is not None:
@@ -597,6 +613,7 @@ def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
         headers=_parse_headers(raw.get("headers"), name),
         sync=sync,
         remote_config=remote_config,
+        artifacts=artifacts,
     )
 
 
