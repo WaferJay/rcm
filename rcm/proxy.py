@@ -18,7 +18,6 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol
 from urllib.parse import unquote_to_bytes, urlsplit
 
 import httpx
-import yaml
 
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import (
@@ -50,12 +49,15 @@ from .artifacts import (
 )
 from .config import (
     Config,
+    ConfigError,
     HeaderSpec,
     ProxyTargetSpec,
     RemoteConfigSpec,
     SyncMappingSpec,
     SyncSpec,
 )
+from .config.loader import decode_yaml_mapping
+from .config.parsing import parse_runtime_sections
 from .store import Store, StoreError
 from .sync import SyncError, SyncRunner
 from .tunnel import (
@@ -122,22 +124,24 @@ async def _read_remote_metadata(target: ProxyTargetSpec) -> RemoteServerMetadata
             f" (exit code {returncode}){suffix}"
         )
 
+    source = f"remote config {path!r}"
     try:
-        raw = yaml.safe_load(stdout)
-    except yaml.YAMLError as exc:
-        raise ProxyError(f"invalid YAML in remote config {path!r}: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise ProxyError(f"remote config {path!r} must contain a mapping")
-
-    server_raw = raw.get("server") or {}
-    if not isinstance(server_raw, dict):
-        raise ProxyError(f"remote config {path!r}: server must be a mapping")
-    transport = server_raw.get("transport", "http")
-    if not isinstance(transport, str) or transport not in {"http", "stdio"}:
-        raise ProxyError(
-            f"remote config {path!r}: server.transport must be `http` or `stdio`, "
-            f"got {transport!r}"
+        raw = decode_yaml_mapping(
+            stdout,
+            source,
+            mapping_error=f"{source} must contain a mapping",
         )
+        runtime = parse_runtime_sections(
+            raw,
+            error_prefix=f"{source}: ",
+            quote_names=False,
+            transport_choices="`http` or `stdio`",
+        )
+    except ConfigError as exc:
+        raise ProxyError(str(exc)) from exc
+
+    server_raw = runtime.server
+    transport = runtime.transport
 
     public_base_url = server_raw.get("public_base_url")
     if public_base_url is not None and (
@@ -160,9 +164,7 @@ async def _read_remote_metadata(target: ProxyTargetSpec) -> RemoteServerMetadata
                 f"remote config {path!r}: server.public_base_url must be an http:// or https:// URL"
             )
 
-    auth_raw = raw.get("auth") or {}
-    if not isinstance(auth_raw, dict):
-        raise ProxyError(f"remote config {path!r}: auth must be a mapping")
+    auth_raw = runtime.auth
     api_key = auth_raw.get("api_key")
     if api_key is not None and (
         not isinstance(api_key, str) or not api_key.strip()
@@ -173,9 +175,7 @@ async def _read_remote_metadata(target: ProxyTargetSpec) -> RemoteServerMetadata
     if isinstance(api_key, str):
         api_key = api_key.strip()
 
-    defaults_raw = raw.get("defaults") or {}
-    if not isinstance(defaults_raw, dict):
-        raise ProxyError(f"remote config {path!r}: defaults must be a mapping")
+    defaults_raw = runtime.defaults
     cwd = defaults_raw.get("cwd")
     if cwd is not None and (not isinstance(cwd, str) or not cwd.strip()):
         raise ProxyError(
