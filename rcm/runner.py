@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import string
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from .artifacts import public_run_result, sha256_file
+from .artifacts import (
+    ARTIFACT_KINDS,
+    ArtifactDescriptor,
+    public_run_result,
+    sha256_file,
+)
+from .collection import ArtifactCollector, DEFAULT_COLLECTOR
 from .config import CommandSpec, ParamSpec
 from .store import Store
 
@@ -100,6 +108,8 @@ async def run_command(
     store: Store,
     default_timeout: float | None,
     default_cwd: str | None,
+    config_path: Path | None = None,
+    collector: ArtifactCollector = DEFAULT_COLLECTOR,
 ) -> dict[str, Any]:
     """Execute one configured command, capturing output to disk."""
     resolved = _resolve_params(spec, supplied_params)
@@ -108,9 +118,22 @@ async def run_command(
     timeout = spec.timeout if spec.timeout is not None else default_timeout
     cwd = spec.cwd if spec.cwd is not None else default_cwd
 
-    run_id, run_dir = store.create_run()
+    run_id, _ = store.create_run()
     stdout_path = store.file_path(run_id, "stdout")
     stderr_path = store.file_path(run_id, "stderr")
+
+    effective_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
+    protected = [store.runs_dir]
+    if config_path is not None:
+        protected.append(config_path.expanduser().resolve())
+    protected_paths = tuple(protected)
+    preparation = None
+    if spec.collect is not None:
+        preparation = await collector.prepare(
+            spec.collect,
+            cwd=effective_cwd,
+            protected_paths=protected_paths,
+        )
 
     started_at = datetime.now(timezone.utc).isoformat()
     t0 = time.monotonic()
@@ -172,6 +195,24 @@ async def run_command(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
+    if spec.collect is not None:
+        outcome = await collector.collect(
+            spec.collect,
+            cwd=effective_cwd,
+            destination=store.file_path(run_id, "collect"),
+            protected_paths=protected_paths,
+            prepared=preparation,
+            command_started=not spawn_failed,
+            returncode=returncode,
+            timed_out=timed_out,
+        )
+        if outcome.published:
+            meta["collect"] = {
+                "bytes": outcome.bytes,
+                "sha256": outcome.sha256,
+            }
+        if outcome.warnings:
+            meta["warnings"] = list(outcome.warnings)
     result = _public_result(meta, store)
     store.write_meta(run_id, {**meta, **result})
     return result
@@ -221,15 +262,20 @@ def _safe_size(path) -> int:
 
 def _public_result(meta: dict[str, Any], store: Store) -> dict[str, Any]:
     run_id = meta["run_id"]
+    artifacts = {
+        name: ArtifactDescriptor(
+            uri=store.url_for(run_id, name),
+            bytes=meta[name]["bytes"],
+            sha256=meta[name]["sha256"],
+        )
+        for name in ARTIFACT_KINDS
+        if name in meta
+    }
     return public_run_result(
         run_id=run_id,
         returncode=meta["returncode"],
         timed_out=meta["timed_out"],
         duration_ms=meta["duration_ms"],
-        stdout_uri=store.url_for(run_id, "stdout"),
-        stdout_bytes=meta["stdout"]["bytes"],
-        stdout_sha256=meta["stdout"]["sha256"],
-        stderr_uri=store.url_for(run_id, "stderr"),
-        stderr_bytes=meta["stderr"]["bytes"],
-        stderr_sha256=meta["stderr"]["sha256"],
+        artifacts=artifacts,
+        warnings=meta.get("warnings", []),
     )

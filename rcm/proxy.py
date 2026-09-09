@@ -34,6 +34,7 @@ from pydantic import PrivateAttr
 from . import __version__
 from .auth import ApiKeyAuth
 from .artifacts import (
+    ARTIFACT_KINDS,
     DEFAULT_ARTIFACT_MODE,
     RCM_CALL_META,
     RCM_CAPABILITY,
@@ -638,14 +639,14 @@ class ProxyTool(Tool):
     def _validate_passthrough(self, remote: RunResult) -> None:
         if self._target_transport != "http":
             raise ArtifactError("artifact passthrough requires an HTTP RCM target")
-        for descriptor in (remote.stdout, remote.stderr):
+        for descriptor in remote.artifacts.values():
             try:
                 parsed = urlsplit(descriptor.uri)
             except ValueError as exc:
                 raise ArtifactError("artifact passthrough URL is invalid") from exc
             if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
                 raise ArtifactError(
-                    "artifact passthrough requires absolute HTTP stdout/stderr URLs"
+                    "artifact passthrough requires absolute HTTP artifact URLs"
                 )
             if parsed.username is not None or parsed.password is not None:
                 raise ArtifactError(
@@ -683,19 +684,27 @@ class ProxyTool(Tool):
             raise ArtifactError("rcm artifact received without a local store")
         run_id, staging = self._store.create_staging_run()
         try:
-            await self._copy_artifact(remote.stdout, staging / "stdout.log")
-            await self._copy_artifact(remote.stderr, staging / "stderr.log")
+            for name, descriptor in remote.artifacts.items():
+                await self._copy_artifact(
+                    descriptor,
+                    staging / ARTIFACT_KINDS[name].filename,
+                )
+            artifacts = {
+                name: ArtifactDescriptor(
+                    uri=self._store.url_for(run_id, name),
+                    bytes=descriptor.bytes,
+                    sha256=descriptor.sha256,
+                )
+                for name, descriptor in remote.artifacts.items()
+            }
             local = public_run_result(
                 run_id=run_id,
                 returncode=remote.returncode,
                 timed_out=remote.timed_out,
                 duration_ms=remote.duration_ms,
-                stdout_uri=self._store.url_for(run_id, "stdout"),
-                stdout_bytes=remote.stdout.bytes,
-                stdout_sha256=remote.stdout.sha256,
-                stderr_uri=self._store.url_for(run_id, "stderr"),
-                stderr_bytes=remote.stderr.bytes,
-                stderr_sha256=remote.stderr.sha256,
+                artifacts=artifacts,
+                warnings=remote.warnings,
+                extra_fields=remote.extra_fields,
             )
             meta = {
                 **local,

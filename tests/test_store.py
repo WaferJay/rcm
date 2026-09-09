@@ -26,11 +26,13 @@ def test_url_for_strips_trailing_slash(tmp_path: Path) -> None:
     assert s.url_for("abc", "stdout") == "https://x.example/runs/abc/stdout"
 
 
-def test_url_for_each_stream(tmp_path: Path) -> None:
+def test_url_for_each_stored_file(tmp_path: Path) -> None:
     s = Store(tmp_path, public_base_url="https://x")
     assert s.url_for("a", "stdout").endswith("/runs/a/stdout")
     assert s.url_for("a", "stderr").endswith("/runs/a/stderr")
+    assert s.url_for("a", "collect").endswith("/runs/a/collect")
     assert s.url_for("a", "meta").endswith("/runs/a/meta")
+    assert s.file_path("a", "collect").name == "collect.tar.gz"
 
 
 def test_local_url_for_uses_absolute_file_uri(tmp_path: Path) -> None:

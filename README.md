@@ -5,10 +5,11 @@ named MCP tools, served over Streamable HTTP or stdio.
 
 - Each command in the YAML config becomes one named MCP tool.
 - Calling a tool runs the command with `shell=False` (no shell expansion),
-  records stdout/stderr to disk, and returns an `rcm.run-result/v2` object with
-  a URI, byte count, and SHA-256 digest for each stream.
-- Stdout/stderr are downloaded over HTTP or HTTPS from
-  `/runs/<run_id>/{stdout,stderr,meta}`. These endpoints are intentionally
+  records stdout/stderr to disk, optionally collects configured output files,
+  and returns an `rcm.run-result/v2` object with a URI, byte count, and SHA-256
+  digest for each artifact.
+- Artifacts are downloaded over HTTP or HTTPS from
+  `/runs/<run_id>/{stdout,stderr,collect,meta}`. These endpoints are intentionally
   **public**; access is gated by the unguessable 256-bit `run_id`
   (capability URLs).
 - The HTTP MCP endpoint requires `Authorization: Bearer <RCM_API_KEY>`;
@@ -31,7 +32,7 @@ echo "API key: $RCM_API_KEY"
 
 uv run python -m rcm
 # MCP endpoint:    $RCM_PUBLIC_BASE_URL/mcp/
-# Output download: $RCM_PUBLIC_BASE_URL/runs/<run_id>/{stdout,stderr,meta}
+# Output download: $RCM_PUBLIC_BASE_URL/runs/<run_id>/{stdout,stderr,collect,meta}
 
 # For a local MCP client, use stdio. API key and public_base_url are not needed.
 uv run python -m rcm --stdio
@@ -89,6 +90,21 @@ commands:
       file:
         type: string
         pattern: '^[A-Za-z0-9._-]+$'
+
+  - name: build_report
+    description: Build a report and collect its output.
+    command: [python, scripts/build_report.py]
+    cwd: /srv/project
+    collect:
+      on_exit: success
+      mode: changed
+      paths:
+        - path: dist/**/*.pdf
+          required: true
+        - path: test-results
+          on_exit: always
+          mode: always
+          required: false
 ```
 
 Rules:
@@ -99,6 +115,38 @@ Rules:
 - `params[*].type` is one of `string`, `integer`, `number`, `boolean`.
 - Optional per-param: `description`, `default`, `pattern` (regex), `enum`.
 - `name` must match `^[a-zA-Z_][a-zA-Z0-9_]*$` and be globally unique.
+
+### Collecting command files
+
+`commands[*].collect.paths` is an allow-list of files and directories to pack.
+Each path is relative to the command's effective `cwd`. POSIX `*`, `?`, `[]`,
+and complete `**` path segments are supported; absolute paths, `..`, backslashes,
+and malformed `**` segments are rejected. Glob matches include both files and
+directories. A matched directory is collected recursively as one unit while
+preserving its relative layout.
+
+`collect.on_exit` controls which process outcomes are eligible: `success`
+(default) requires exit code zero without a timeout, while `always` also handles
+non-zero exits and timeouts after the process has started. `collect.mode` is
+`always` by default; `changed` publishes a path only when its type, metadata,
+link target, contents, or recursive directory tree differs from the pre-command
+snapshot. Metadata is checked first; when it is unchanged, SHA-256 content
+fingerprints provide the final comparison. Both settings can be overridden on
+an individual path.
+
+`required` defaults to `false`. A missing or unreadable optional path is skipped
+and recorded in the result's `warnings`. If a required path is unavailable, no
+collect archive is published, but the command result and stdout/stderr remain
+available. An unchanged required path still satisfies `required`; if no rule
+selects content, an empty archive is not published. Deleted changed paths are
+reported as warnings.
+
+The collect artifact is a gzip-compressed tar served from
+`/runs/<run_id>/collect` with media type `application/gzip`. Compression uses
+gzip level 6. To avoid leaking host identities, every tar member has UID/GID
+normalized to `0/0`, empty user/group names, and no ownership-related PAX
+headers. Symbolic links are archived without following them. The active RCM
+configuration and `RCM_RUNS_DIR` are always excluded.
 
 ## Proxy and combined configurations
 
@@ -210,13 +258,16 @@ HTTP/SSE targets use the native MCP client transports. SSH credentials are
 taken from the local OpenSSH configuration, agent, and keys. The local machine
 must provide `rsync` for synchronized targets and `ssh` for SSH targets.
 
-RCM servers advertise the v2 artifact capability during MCP initialization.
+RCM servers advertise the v2 artifact capability and supported artifact kinds
+during MCP initialization.
 For another RCM, `artifacts` defaults to `localize`: a local stdio proxy reads
 the returned `file://` URI directly, an SSH proxy streams the file over the
 same SSH host, and an HTTP proxy downloads the returned URL. The proxy verifies
-the declared size and SHA-256 of both streams, creates a new local run, and
-returns URIs appropriate for its own server transport (`file://` for stdio,
-HTTP URLs for HTTP). No command output is embedded in the MCP tool response.
+the declared size and SHA-256 of every returned artifact, creates a new local
+run, and returns URIs appropriate for its own server transport (`file://` for
+stdio, HTTP URLs for HTTP). Stdout, stderr, and collect use this same byte-for-byte
+copy and validation path; collect is never decompressed or recompressed by a
+proxy. No command output is embedded in the MCP tool response.
 
 An HTTP RCM target can instead set `artifacts: passthrough`. Its run ID and
 HTTP artifact URLs are then returned without a local copy, even when the outer
@@ -225,6 +276,11 @@ explicit `artifacts` setting also requires the target to identify itself as an
 RCM v2 server. Results from ordinary MCP services are always passed through
 unchanged. Targets discovered through `ssh` plus `config` are RCM-specific and
 therefore also require the remote server to support v2.
+
+`collect` is an additive v2 field. Proxies from before collect support continue
+to handle stdout/stderr, but may omit collect while rebuilding a localized
+result. Upgrade every RCM in a proxy chain when collected files must reach the
+outermost caller.
 
 ## HTTPS and self-signed certificates
 
@@ -279,7 +335,7 @@ When `proxy` is configured, use the same endpoint and call remote tools using
 their prefixed names, such as `compile__build`. Local command tools remain
 available under their original names.
 
-A `tools/call` for `tail_log` with `{lines: 100, file: "nginx.log"}` returns:
+A successful call to a command with `collect` configured returns:
 
 ```json
 {
@@ -297,6 +353,11 @@ A `tools/call` for `tail_log` with `{lines: 100, file: "nginx.log"}` returns:
     "uri": "https://rcm.example.com/runs/k7Q.../stderr",
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "collect": {
+    "uri": "https://rcm.example.com/runs/k7Q.../collect",
+    "bytes": 10240,
+    "sha256": "..."
   }
 }
 ```
@@ -306,6 +367,8 @@ Then download the output (no auth header needed; the `run_id` is the secret):
 ```bash
 curl https://rcm.example.com/runs/k7Q.../stdout
 curl https://rcm.example.com/runs/k7Q.../stderr
+curl -o collect.tar.gz https://rcm.example.com/runs/k7Q.../collect
+tar -tzf collect.tar.gz
 curl 'https://rcm.example.com/runs/k7Q.../stdout?tail=4096'
 ```
 
@@ -321,7 +384,7 @@ curl 'https://rcm.example.com/runs/k7Q.../stdout?tail=4096'
 | `RCM_TLS_CERT_FILE` / `RCM_TLS_KEY_FILE` | Overrides the configured certificate/key paths. |
 | `RCM_TLS_AUTO_GENERATE` | Overrides `server.tls.auto_generate`. |
 | `RCM_TLS_HOSTNAMES` | Comma-separated SAN hostnames/IP addresses. |
-| `RCM_RUNS_DIR` | Where stdout/stderr/meta are written (default: `./runs`). |
+| `RCM_RUNS_DIR` | Where stdout/stderr/collect/meta are written (default: `./runs`). |
 | `RCM_RUNS_RETENTION` | Keep at most N runs on disk (pruned at startup). `0` = keep all. |
 | Target header `env` values | Environment variables referenced by proxy target headers are resolved at startup. |
 

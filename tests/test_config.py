@@ -112,6 +112,100 @@ def test_full_command_with_params_and_defaults(tmp_path: Path) -> None:
     assert file_p.has_default is False
 
 
+def test_load_command_collect_paths(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            commands:
+              - name: build
+                description: Build artifacts.
+                command: [make, build]
+                collect:
+                  on_exit: always
+                  mode: changed
+                  paths:
+                    - path: dist/**/*.tar.gz
+                      required: true
+                    - path: reports/*
+                      on_exit: success
+                      mode: always
+            """,
+        )
+    )
+
+    collect = cfg.commands[0].collect
+    assert collect is not None
+    assert collect.on_exit == "always"
+    assert collect.mode == "changed"
+    assert [
+        (item.path, item.required, item.on_exit, item.mode)
+        for item in collect.paths
+    ] == [
+        ("dist/**/*.tar.gz", True, None, None),
+        ("reports/*", False, "success", "always"),
+    ]
+
+
+def test_command_collect_defaults_preserve_successful_full_collection(
+    tmp_path: Path,
+) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            commands:
+              - name: build
+                description: Build artifacts.
+                command: [make, build]
+                collect:
+                  paths:
+                    - path: dist
+            """,
+        )
+    )
+
+    collect = cfg.commands[0].collect
+    assert collect is not None
+    assert collect.on_exit == "success"
+    assert collect.mode == "always"
+
+
+@pytest.mark.parametrize(
+    "collect_body,fragment",
+    [
+        ("{}", "non-empty list"),
+        ("{paths: []}", "non-empty list"),
+        ("{paths: [artifact.txt]}", "must be a mapping"),
+        ("{paths: [{path: /absolute}]}", "relative POSIX path"),
+        ("{paths: [{path: ../escape}]}", "must not contain"),
+        ("{paths: [{path: dir/}]}", "must not contain"),
+        ("{paths: [{path: 'dist/**.whl'}]}", "complete path part"),
+        ("{paths: [{path: out, required: 1}]}", "must be a boolean"),
+        ("{on_exit: failure, paths: [{path: out}]}", "on_exit must be one of"),
+        ("{mode: newer, paths: [{path: out}]}", "mode must be one of"),
+        ("{paths: [{path: out, on_exit: failure}]}", "on_exit must be one of"),
+        ("{paths: [{path: out, mode: newer}]}", "mode must be one of"),
+    ],
+)
+def test_invalid_command_collect_rejected(
+    tmp_path: Path, collect_body: str, fragment: str
+) -> None:
+    with pytest.raises(ConfigError, match=fragment):
+        load_config(
+            write(
+                tmp_path,
+                f"""
+                commands:
+                  - name: build
+                    description: Build artifacts.
+                    command: [make, build]
+                    collect: {collect_body}
+                """,
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "body, fragment",
     [

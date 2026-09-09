@@ -86,3 +86,20 @@ commands:
     description: Print system uptime and load average.
     command: ["uptime"]
     timeout: 5
+
+  # Collect files or directories relative to the command's effective cwd.
+  # POSIX glob patterns are supported; matched directories are recursive units.
+  # - name: build_report
+  #   description: Build and collect a report.
+  #   command: [python, scripts/build_report.py]
+  #   cwd: /srv/project
+  #   collect:
+  #     on_exit: success  # success (default) or always
+  #     mode: changed     # always (default) or changed
+  #     paths:
+  #       - path: dist/**/*.pdf
+  #         required: true
+  #       - path: test-results
+  #         on_exit: always
+  #         mode: always
+  #         required: false

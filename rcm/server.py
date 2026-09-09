@@ -18,7 +18,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 from . import __version__
-from .artifacts import RCM_EXPERIMENTAL_CAPABILITIES
+from .artifacts import ARTIFACT_KINDS, ArtifactKind, RCM_EXPERIMENTAL_CAPABILITIES
 from .auth import ApiKeyAuth
 from .config import CommandSpec, Config, ParamSpec, TLSConfig, load_config
 from .runner import run_command
@@ -35,7 +35,11 @@ PY_TYPES: dict[str, type] = {
 
 
 def _build_tool_fn(
-    spec: CommandSpec, default_timeout: float | None, default_cwd: str | None, store: Store
+    spec: CommandSpec,
+    default_timeout: float | None,
+    default_cwd: str | None,
+    store: Store,
+    config_path: Path | None = None,
 ):
     """Synthesize an `async def <spec.name>(...)` function whose signature matches spec.params."""
     params: list[inspect.Parameter] = []
@@ -61,6 +65,7 @@ def _build_tool_fn(
             store=store,
             default_timeout=default_timeout,
             default_cwd=default_cwd,
+            config_path=config_path,
         )
 
     _impl.__name__ = spec.name
@@ -93,6 +98,14 @@ def _format_docstring(spec: CommandSpec) -> str:
             "a URI, byte count, and SHA-256 digest. The run_id is the URL secret.",
         ]
     )
+    if spec.collect is not None:
+        lines.extend(
+            [
+                "",
+                "When configured collection rules apply, collect contains a URI, byte",
+                "count, and SHA-256 digest for a tar.gz command artifact.",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -104,11 +117,13 @@ def _not_found(msg: str = "not found") -> Response:
     return JSONResponse({"error": msg}, status_code=404)
 
 
-def _serve_log(path: Path, request: Request, content_type: str) -> Response:
+def _serve_artifact(path: Path, request: Request, kind: ArtifactKind) -> Response:
     if not path.is_file():
-        return _not_found("log file not found")
+        return _not_found("artifact not found")
     tail_raw = request.query_params.get("tail")
     if tail_raw is not None:
+        if not kind.supports_tail:
+            return _bad_request(f"`tail` is not supported for {kind.name}")
         try:
             tail = int(tail_raw)
         except ValueError:
@@ -120,33 +135,11 @@ def _serve_log(path: Path, request: Request, content_type: str) -> Response:
         with open(path, "rb") as f:
             f.seek(offset)
             data = f.read()
-        return Response(content=data, media_type=content_type)
-    return FileResponse(path, media_type=content_type)
+        return Response(content=data, media_type=kind.media_type)
+    return FileResponse(path, media_type=kind.media_type)
 
 
 def _register_download_routes(mcp: FastMCP, store: Store) -> None:
-    @mcp.custom_route("/runs/{run_id}/stdout", methods=["GET"])
-    async def stdout_route(request: Request) -> Response:
-        run_id = request.path_params["run_id"]
-        if not RUN_ID_RE.fullmatch(run_id):
-            return _bad_request("invalid run_id")
-        return _serve_log(
-            store.file_path(run_id, "stdout"),
-            request,
-            "text/plain; charset=utf-8",
-        )
-
-    @mcp.custom_route("/runs/{run_id}/stderr", methods=["GET"])
-    async def stderr_route(request: Request) -> Response:
-        run_id = request.path_params["run_id"]
-        if not RUN_ID_RE.fullmatch(run_id):
-            return _bad_request("invalid run_id")
-        return _serve_log(
-            store.file_path(run_id, "stderr"),
-            request,
-            "text/plain; charset=utf-8",
-        )
-
     @mcp.custom_route("/runs/{run_id}/meta", methods=["GET"])
     async def meta_route(request: Request) -> Response:
         run_id = request.path_params["run_id"]
@@ -161,6 +154,17 @@ def _register_download_routes(mcp: FastMCP, store: Store) -> None:
             return _not_found("meta not readable")
         return JSONResponse(data)
 
+    @mcp.custom_route("/runs/{run_id}/{artifact}", methods=["GET"])
+    async def artifact_route(request: Request) -> Response:
+        run_id = request.path_params["run_id"]
+        if not RUN_ID_RE.fullmatch(run_id):
+            return _bad_request("invalid run_id")
+        artifact = request.path_params["artifact"]
+        kind = ARTIFACT_KINDS.get(artifact)
+        if kind is None:
+            return _not_found("unknown artifact")
+        return _serve_artifact(store.file_path(run_id, artifact), request, kind)
+
     @mcp.custom_route("/healthz", methods=["GET"])
     async def healthz(_: Request) -> Response:
         return PlainTextResponse("ok")
@@ -168,7 +172,13 @@ def _register_download_routes(mcp: FastMCP, store: Store) -> None:
 
 def _register_command_tools(mcp: FastMCP, cfg: Config, store: Store) -> None:
     for spec in cfg.commands:
-        fn = _build_tool_fn(spec, cfg.defaults.timeout, cfg.defaults.cwd, store)
+        fn = _build_tool_fn(
+            spec,
+            cfg.defaults.timeout,
+            cfg.defaults.cwd,
+            store,
+            cfg.config_path,
+        )
         mcp.tool(fn)
 
 

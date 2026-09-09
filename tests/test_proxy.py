@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import socket
@@ -16,6 +17,8 @@ from mcp.types import CallToolResult, TextContent
 
 from rcm.config import (
     AuthSpec,
+    CollectPathSpec,
+    CollectSpec,
     CommandSpec,
     Config,
     DefaultsSpec,
@@ -146,12 +149,15 @@ async def test_proxy_tool_blocks_call_when_sync_fails() -> None:
 async def test_proxy_tool_localizes_stdio_rcm_files(tmp_path) -> None:
     stdout = b"\x00remote\xff\n"
     stderr = b"warning\n"
+    collect = gzip.compress(b"collected tar bytes", mtime=0)
     upstream = tmp_path / "upstream"
     upstream.mkdir()
     stdout_path = upstream / "stdout.log"
     stderr_path = upstream / "stderr.log"
+    collect_path = upstream / "collect.tar.gz"
     stdout_path.write_bytes(stdout)
     stderr_path.write_bytes(stderr)
+    collect_path.write_bytes(collect)
 
     class ArtifactClient:
         async def call_tool_mcp(
@@ -176,6 +182,20 @@ async def test_proxy_tool_localizes_stdio_rcm_files(tmp_path) -> None:
                         "bytes": len(stderr),
                         "sha256": hashlib.sha256(stderr).hexdigest(),
                     },
+                    "collect": {
+                        "uri": collect_path.as_uri(),
+                        "bytes": len(collect),
+                        "sha256": hashlib.sha256(collect).hexdigest(),
+                    },
+                    "warnings": [
+                        {
+                            "code": "collect_path_missing",
+                            "path": "optional.txt",
+                            "required": False,
+                            "message": "optional collect path does not exist",
+                        }
+                    ],
+                    "extension": {"preserved": True},
                 },
             )
 
@@ -202,6 +222,10 @@ async def test_proxy_tool_localizes_stdio_rcm_files(tmp_path) -> None:
     assert data["stderr"]["uri"].startswith("https://outer.example/runs/")
     assert store.file_path(data["run_id"], "stdout").read_bytes() == stdout
     assert store.file_path(data["run_id"], "stderr").read_bytes() == stderr
+    assert store.file_path(data["run_id"], "collect").name == "collect.tar.gz"
+    assert store.file_path(data["run_id"], "collect").read_bytes() == collect
+    assert data["warnings"][0]["path"] == "optional.txt"
+    assert data["extension"] == {"preserved": True}
     assert json.loads(result.content[0].text) == data
 
 
@@ -314,6 +338,11 @@ async def test_http_rcm_passthrough_keeps_remote_result(tmp_path) -> None:
             "bytes": 0,
             "sha256": hashlib.sha256(b"").hexdigest(),
         },
+        "collect": {
+            "uri": "https://remote.example/runs/remote-run/collect",
+            "bytes": 3,
+            "sha256": hashlib.sha256(b"tar").hexdigest(),
+        },
     }
 
     class RcmClient:
@@ -390,12 +419,17 @@ async def test_failed_localization_removes_staging_run(tmp_path) -> None:
         "stdout": {
             "uri": source.as_uri(),
             "bytes": 6,
-            "sha256": "0" * 64,
+            "sha256": hashlib.sha256(b"actual").hexdigest(),
         },
         "stderr": {
             "uri": source.as_uri(),
             "bytes": 6,
             "sha256": hashlib.sha256(b"actual").hexdigest(),
+        },
+        "collect": {
+            "uri": source.as_uri(),
+            "bytes": 6,
+            "sha256": "0" * 64,
         },
     }
 
@@ -835,6 +869,8 @@ async def test_http_rcm_target_localizes_or_passthroughs_artifacts(tmp_path) -> 
     port = sock.getsockname()[1]
     sock.close()
     base_url = f"http://127.0.0.1:{port}"
+    remote_work = tmp_path / "remote-work"
+    remote_work.mkdir()
     remote_cfg = Config(
         server=ServerSpec(public_base_url=base_url),
         auth=AuthSpec(api_key=None),
@@ -846,8 +882,10 @@ async def test_http_rcm_target_localizes_or_passthroughs_artifacts(tmp_path) -> 
                 command=[
                     sys.executable,
                     "-c",
-                    "import sys;sys.stdout.buffer.write(b'out\\x00');sys.stderr.buffer.write(b'err')",
+                    "from pathlib import Path;import sys;Path('artifact.bin').write_bytes(b'artifact');sys.stdout.buffer.write(b'out\\x00');sys.stderr.buffer.write(b'err')",
                 ],
+                cwd=str(remote_work),
+                collect=CollectSpec(paths=(CollectPathSpec("artifact.bin"),)),
             )
         ],
     )
@@ -907,12 +945,16 @@ async def test_http_rcm_target_localizes_or_passthroughs_artifacts(tmp_path) -> 
         assert localized["stdout"]["uri"].startswith("file://")
         assert Path(urlparse(localized["stdout"]["uri"]).path).read_bytes() == b"out\x00"
         assert Path(urlparse(localized["stderr"]["uri"]).path).read_bytes() == b"err"
+        localized_collect = Path(urlparse(localized["collect"]["uri"]).path)
+        assert localized_collect.name == "collect.tar.gz"
+        assert localized_collect.read_bytes().startswith(b"\x1f\x8b")
         assert len(list(local_store.runs_dir.iterdir())) == 1
 
         passed, passthrough_store = await call_through(
             "passthrough", "passthrough-runs"
         )
         assert passed["stdout"]["uri"].startswith(f"{base_url}/runs/")
+        assert passed["collect"]["uri"].startswith(f"{base_url}/runs/")
         assert passed["run_id"] in {
             child.name for child in remote_store.runs_dir.iterdir()
         }

@@ -16,6 +16,8 @@ NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 PARAM_TYPES = {"string", "integer", "number", "boolean"}
 PROXY_TRANSPORTS = {"stdio", "ssh", "http", "sse"}
 SERVER_TRANSPORTS = {"http", "stdio"}
+COLLECT_ON_EXIT = {"success", "always"}
+COLLECT_MODES = {"always", "changed"}
 
 
 class ConfigError(ValueError):
@@ -33,6 +35,21 @@ class ParamSpec:
     enum: list[Any] | None = None
 
 
+@dataclass(frozen=True)
+class CollectPathSpec:
+    path: str
+    required: bool = False
+    on_exit: str | None = None
+    mode: str | None = None
+
+
+@dataclass(frozen=True)
+class CollectSpec:
+    paths: tuple[CollectPathSpec, ...]
+    on_exit: str = "success"
+    mode: str = "always"
+
+
 @dataclass
 class CommandSpec:
     name: str
@@ -41,6 +58,7 @@ class CommandSpec:
     params: list[ParamSpec] = field(default_factory=list)
     timeout: float | None = None
     cwd: str | None = None
+    collect: CollectSpec | None = None
 
 
 @dataclass
@@ -233,6 +251,90 @@ def _parse_param(name: str, raw: dict[str, Any]) -> ParamSpec:
     return spec
 
 
+def _parse_collect(raw: Any, command_name: str) -> CollectSpec | None:
+    if raw is None:
+        return None
+    context = f"command {command_name!r}: collect"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{context} must be a mapping")
+    unknown = set(raw) - {"paths", "on_exit", "mode"}
+    if unknown:
+        raise ConfigError(f"{context} has unknown fields: {sorted(unknown)}")
+
+    on_exit = raw.get("on_exit", "success")
+    if not isinstance(on_exit, str) or on_exit not in COLLECT_ON_EXIT:
+        raise ConfigError(
+            f"{context}.on_exit must be one of {sorted(COLLECT_ON_EXIT)}, "
+            f"got {on_exit!r}"
+        )
+    mode = raw.get("mode", "always")
+    if not isinstance(mode, str) or mode not in COLLECT_MODES:
+        raise ConfigError(
+            f"{context}.mode must be one of {sorted(COLLECT_MODES)}, got {mode!r}"
+        )
+
+    paths_raw = raw.get("paths")
+    if not isinstance(paths_raw, list) or not paths_raw:
+        raise ConfigError(f"{context}.paths must be a non-empty list")
+
+    paths: list[CollectPathSpec] = []
+    for index, item in enumerate(paths_raw):
+        item_context = f"{context}.paths[{index}]"
+        if not isinstance(item, dict):
+            raise ConfigError(f"{item_context} must be a mapping")
+        unknown = set(item) - {"path", "required", "on_exit", "mode"}
+        if unknown:
+            raise ConfigError(
+                f"{item_context} has unknown fields: {sorted(unknown)}"
+            )
+        path = item.get("path")
+        if not isinstance(path, str) or not path.strip():
+            raise ConfigError(f"{item_context}.path must be a non-empty string")
+        path = path.strip()
+        if "\x00" in path:
+            raise ConfigError(f"{item_context}.path must not contain a NUL byte")
+        if path.startswith("/") or "\\" in path:
+            raise ConfigError(f"{item_context}.path must be a relative POSIX path")
+        parts = path.split("/")
+        if any(part in {"", ".", ".."} for part in parts):
+            raise ConfigError(
+                f"{item_context}.path must not contain empty, `.` or `..` path parts"
+            )
+        if any("**" in part and part != "**" for part in parts):
+            raise ConfigError(
+                f"{item_context}.path only supports `**` as a complete path part"
+            )
+        required = item.get("required", False)
+        if not isinstance(required, bool):
+            raise ConfigError(f"{item_context}.required must be a boolean")
+        path_on_exit = item.get("on_exit")
+        if path_on_exit is not None and (
+            not isinstance(path_on_exit, str) or path_on_exit not in COLLECT_ON_EXIT
+        ):
+            raise ConfigError(
+                f"{item_context}.on_exit must be one of "
+                f"{sorted(COLLECT_ON_EXIT)}, got {path_on_exit!r}"
+            )
+        path_mode = item.get("mode")
+        if path_mode is not None and (
+            not isinstance(path_mode, str) or path_mode not in COLLECT_MODES
+        ):
+            raise ConfigError(
+                f"{item_context}.mode must be one of {sorted(COLLECT_MODES)}, "
+                f"got {path_mode!r}"
+            )
+        paths.append(
+            CollectPathSpec(
+                path=path,
+                required=required,
+                on_exit=path_on_exit,
+                mode=path_mode,
+            )
+        )
+
+    return CollectSpec(paths=tuple(paths), on_exit=on_exit, mode=mode)
+
+
 def _parse_command(raw: dict[str, Any]) -> CommandSpec:
     if not isinstance(raw, dict):
         raise ConfigError("each entry in `commands` must be a mapping")
@@ -292,6 +394,7 @@ def _parse_command(raw: dict[str, Any]) -> CommandSpec:
         params=params,
         timeout=float(timeout) if timeout is not None else None,
         cwd=cwd,
+        collect=_parse_collect(raw.get("collect"), name),
     )
 
 

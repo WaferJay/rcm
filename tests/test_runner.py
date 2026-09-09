@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import hashlib
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
 
-from rcm.config import CommandSpec, ParamSpec
+from rcm.config import CollectPathSpec, CollectSpec, CommandSpec, ParamSpec
 from rcm.runner import RunError, _resolve_params, _substitute, run_command
 from rcm.store import Store
 
@@ -227,3 +228,200 @@ async def test_run_command_pattern_rejection_does_not_create_run(tmp_path: Path)
         )
     # Validation happens before the run dir is created.
     assert not (tmp_path / "runs").exists() or not list((tmp_path / "runs").iterdir())
+
+
+async def test_run_command_publishes_collect_artifact(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    spec = CommandSpec(
+        name="build",
+        description="Build an artifact.",
+        command=[
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('dist').mkdir(); Path('dist/app.bin').write_bytes(b'app')",
+        ],
+        cwd=str(tmp_path),
+        collect=CollectSpec(paths=(CollectPathSpec("dist/app.bin"),)),
+    )
+
+    result = await run_command(
+        spec, {}, store=store, default_timeout=10, default_cwd=None
+    )
+
+    assert result["collect"]["uri"].endswith("/collect")
+    collect_path = store.file_path(result["run_id"], "collect")
+    assert result["collect"]["bytes"] == collect_path.stat().st_size
+    assert result["collect"]["sha256"] == hashlib.sha256(
+        collect_path.read_bytes()
+    ).hexdigest()
+    assert collect_path.name == "collect.tar.gz"
+    with tarfile.open(collect_path, "r:gz") as archive:
+        member_file = archive.extractfile("dist/app.bin")
+        assert member_file is not None
+        assert member_file.read() == b"app"
+    meta = json.loads(store.file_path(result["run_id"], "meta").read_text())
+    assert meta["collect"] == result["collect"]
+
+
+async def test_run_command_does_not_collect_after_nonzero_exit(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    spec = CommandSpec(
+        name="failed_build",
+        description="Fail after writing an artifact.",
+        command=[
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('artifact').write_text('old'); raise SystemExit(2)",
+        ],
+        cwd=str(tmp_path),
+        collect=CollectSpec(paths=(CollectPathSpec("artifact"),)),
+    )
+
+    result = await run_command(
+        spec, {}, store=store, default_timeout=10, default_cwd=None
+    )
+
+    assert result["returncode"] == 2
+    assert "collect" not in result
+    assert not store.file_path(result["run_id"], "collect").exists()
+
+
+async def test_run_command_collects_after_failure_when_configured(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    spec = CommandSpec(
+        name="failed_build",
+        description="Collect diagnostics after failure.",
+        command=[
+            sys.executable,
+            "-c",
+            "from pathlib import Path; "
+            "Path('failure.log').write_text('diagnostic'); "
+            "raise SystemExit(2)",
+        ],
+        cwd=str(tmp_path),
+        collect=CollectSpec(
+            paths=(CollectPathSpec("failure.log"),),
+            on_exit="always",
+        ),
+    )
+
+    result = await run_command(
+        spec, {}, store=store, default_timeout=10, default_cwd=None
+    )
+
+    assert result["returncode"] == 2
+    assert result["collect"]["uri"].endswith("/collect")
+    with tarfile.open(
+        store.file_path(result["run_id"], "collect"), "r:gz"
+    ) as archive:
+        member = archive.extractfile("failure.log")
+        assert member is not None
+        assert member.read() == b"diagnostic"
+
+
+async def test_run_command_changed_mode_omits_unchanged_file(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    (tmp_path / "artifact.txt").write_text("same", encoding="utf-8")
+    spec = CommandSpec(
+        name="noop",
+        description="Do not change the artifact.",
+        command=[sys.executable, "-c", "pass"],
+        cwd=str(tmp_path),
+        collect=CollectSpec(
+            paths=(CollectPathSpec("artifact.txt"),),
+            mode="changed",
+        ),
+    )
+
+    result = await run_command(
+        spec, {}, store=store, default_timeout=10, default_cwd=None
+    )
+
+    assert result["returncode"] == 0
+    assert "collect" not in result
+
+
+async def test_run_command_path_policy_overrides_collect_defaults(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    (tmp_path / "always.txt").write_text("existing", encoding="utf-8")
+    spec = CommandSpec(
+        name="mixed",
+        description="Exercise path policy overrides.",
+        command=[sys.executable, "-c", "raise SystemExit(3)"],
+        cwd=str(tmp_path),
+        collect=CollectSpec(
+            paths=(
+                CollectPathSpec(
+                    "always.txt",
+                    on_exit="always",
+                    mode="always",
+                ),
+            ),
+            on_exit="success",
+            mode="changed",
+        ),
+    )
+
+    result = await run_command(
+        spec, {}, store=store, default_timeout=10, default_cwd=None
+    )
+
+    assert result["returncode"] == 3
+    assert "collect" in result
+
+
+async def test_run_command_does_not_collect_when_process_cannot_start(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    (tmp_path / "old.log").write_text("stale", encoding="utf-8")
+    spec = CommandSpec(
+        name="missing",
+        description="Fail before process startup.",
+        command=["/no/such/executable"],
+        cwd=str(tmp_path),
+        collect=CollectSpec(
+            paths=(CollectPathSpec("old.log"),),
+            on_exit="always",
+        ),
+    )
+
+    result = await run_command(
+        spec, {}, store=store, default_timeout=10, default_cwd=None
+    )
+
+    assert result["returncode"] == 127
+    assert "collect" not in result
+
+
+async def test_run_command_on_exit_always_collects_after_timeout(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    spec = CommandSpec(
+        name="timeout_diagnostics",
+        description="Collect a file after timeout.",
+        command=[
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import time; "
+            "Path('timeout.log').write_text('started'); time.sleep(5)",
+        ],
+        timeout=0.5,
+        cwd=str(tmp_path),
+        collect=CollectSpec(
+            paths=(CollectPathSpec("timeout.log"),),
+            on_exit="always",
+        ),
+    )
+
+    result = await run_command(
+        spec, {}, store=store, default_timeout=None, default_cwd=None
+    )
+
+    assert result["timed_out"] is True
+    assert "collect" in result

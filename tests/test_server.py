@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import inspect
 import os
 import sys
+import tarfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,6 +17,8 @@ from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 
 from rcm.config import (
     AuthSpec,
+    CollectPathSpec,
+    CollectSpec,
     CommandSpec,
     Config,
     DefaultsSpec,
@@ -83,6 +87,17 @@ async def running_server(tmp_path: Path, free_port: int):
                 command=[sys.executable, "-c", "import sys; print(sys.argv[1])", "{w}"],
                 params=[ParamSpec(name="w", type="string", pattern=r"^[a-z]+$")],
             ),
+            CommandSpec(
+                name="make_artifact",
+                description="Create a collected artifact.",
+                command=[
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('artifact.bin').write_bytes(b'artifact')",
+                ],
+                cwd=str(tmp_path),
+                collect=CollectSpec(paths=(CollectPathSpec("artifact.bin"),)),
+            ),
         ],
     )
     store = Store(tmp_path / "runs", public_base_url=f"http://127.0.0.1:{free_port}")
@@ -124,7 +139,7 @@ async def test_list_tools_with_valid_key(running_server) -> None:
     async with client:
         tools = await client.list_tools()
     names = {t.name for t in tools}
-    assert names == {"echo_hi", "echo_arg"}
+    assert names == {"echo_hi", "echo_arg", "make_artifact"}
     arg_tool = next(t for t in tools if t.name == "echo_arg")
     assert "w" in (arg_tool.inputSchema or {}).get("properties", {})
 
@@ -136,7 +151,13 @@ async def test_server_advertises_rcm_v2_without_internal_tools(running_server) -
         initialized = client.initialize_result
     assert initialized is not None
     assert initialized.capabilities.experimental["rcm.artifacts"]["versions"] == [2]
-    assert {tool.name for tool in tools} == {"echo_hi", "echo_arg"}
+    capability = initialized.capabilities.experimental["rcm.artifacts"]
+    assert capability["artifactKinds"] == ["stdout", "stderr", "collect"]
+    assert {tool.name for tool in tools} == {
+        "echo_hi",
+        "echo_arg",
+        "make_artifact",
+    }
 
 
 async def test_list_tools_without_key_rejected(running_server) -> None:
@@ -257,6 +278,29 @@ async def test_download_tail_returns_suffix(running_server) -> None:
         resp = await h.get(f"{base}/runs/{rid}/stdout?tail=1")
         assert resp.status_code == 200
         assert resp.content == b"\n"  # last byte of "hi\n"
+
+
+async def test_download_collect_artifact(running_server) -> None:
+    import httpx
+
+    client = make_client(running_server["url"], "testkey")
+    async with client:
+        result = await client.call_tool("make_artifact", {})
+    data = result.data
+    assert data["collect"]["uri"].endswith("/collect")
+
+    async with httpx.AsyncClient() as http:
+        response = await http.get(data["collect"]["uri"])
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/gzip"
+        with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as archive:
+            member_file = archive.extractfile("artifact.bin")
+            assert member_file is not None
+            assert member_file.read() == b"artifact"
+
+        response = await http.get(f'{data["collect"]["uri"]}?tail=1')
+        assert response.status_code == 400
+        assert "not supported" in response.text
 
 
 async def test_download_invalid_run_id(running_server) -> None:

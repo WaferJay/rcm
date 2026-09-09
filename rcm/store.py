@@ -7,10 +7,10 @@ import re
 import secrets
 import shutil
 from pathlib import Path
-from typing import Literal
+
+from .artifacts import ARTIFACT_KINDS
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-Stream = Literal["stdout", "stderr", "meta"]
 
 
 class StoreError(Exception):
@@ -74,21 +74,20 @@ class Store:
         staging.replace(destination)
         return destination
 
-    def file_path(self, run_id: str, stream: Stream) -> Path:
+    def file_path(self, run_id: str, name: str) -> Path:
         d = self.run_dir(run_id)
-        if stream == "stdout":
-            return d / "stdout.log"
-        if stream == "stderr":
-            return d / "stderr.log"
-        if stream == "meta":
+        if name == "meta":
             return d / "meta.json"
-        raise StoreError(f"unknown stream {stream!r}")
+        kind = ARTIFACT_KINDS.get(name)
+        if kind is None:
+            raise StoreError(f"unknown stored file {name!r}")
+        return d / kind.filename
 
-    def url_for(self, run_id: str, stream: Stream) -> str:
+    def url_for(self, run_id: str, name: str) -> str:
         if self.local_urls:
-            return self.file_path(run_id, stream).resolve().as_uri()
+            return self.file_path(run_id, name).resolve().as_uri()
         # capability URL: relies on run_id randomness for confidentiality.
-        return f"{self.public_base_url}/runs/{run_id}/{stream}"
+        return f"{self.public_base_url}/runs/{run_id}/{name}"
 
     def write_meta(self, run_id: str, meta: dict) -> None:
         path = self.file_path(run_id, "meta")
