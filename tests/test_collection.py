@@ -3,17 +3,57 @@
 from __future__ import annotations
 
 import os
+import pickle
 import tarfile
 from pathlib import Path
 
 import pytest
 
+import rcm.collection as collection_module
 from rcm.collection import TarCollector, _expand_pattern, _sanitize_member
 from rcm.config import CollectPathSpec, CollectSpec
 
 
 def _spec(*paths: CollectPathSpec) -> CollectSpec:
     return CollectSpec(paths=paths)
+
+
+def test_collection_package_preserves_legacy_api() -> None:
+    assert collection_module.TarCollector is collection_module.TarGzipCollector
+    assert isinstance(
+        collection_module.DEFAULT_COLLECTOR,
+        collection_module.TarGzipCollector,
+    )
+    assert collection_module._expand_pattern is _expand_pattern
+    assert collection_module._sanitize_member is _sanitize_member
+
+    exported_types = (
+        "ArchiveResult",
+        "ArchiveWriter",
+        "ArtifactCollector",
+        "ChangeDetector",
+        "CollectionOutcome",
+        "CollectionPreparation",
+        "EntitySnapshot",
+        "MemberMetadata",
+        "MemberSnapshot",
+        "MetadataSha256ChangeDetector",
+        "PathMatcher",
+        "PosixGlobMatcher",
+        "RulePreparation",
+        "SnapshotError",
+        "TarGzipArchiveWriter",
+        "TarGzipCollector",
+    )
+    assert set(exported_types) <= set(collection_module.__all__)
+    assert all(
+        getattr(collection_module, name).__module__ == "rcm.collection"
+        for name in exported_types
+    )
+    assert _expand_pattern.__module__ == "rcm.collection"
+    assert _sanitize_member.__module__ == "rcm.collection"
+    outcome = collection_module.CollectionOutcome(published=False)
+    assert pickle.loads(pickle.dumps(outcome)) == outcome
 
 
 def test_leading_recursive_glob_does_not_create_a_dot_archive_root(
