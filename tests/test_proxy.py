@@ -7,12 +7,14 @@ import gzip
 import hashlib
 import json
 import socket
+from contextlib import AsyncExitStack
 from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
 import httpx
 from fastmcp import FastMCP
+from fastmcp.client.transports import StreamableHttpTransport
 from mcp.types import CallToolResult, TextContent
 
 from rcm.config import (
@@ -33,6 +35,7 @@ from rcm.config import (
 )
 from rcm.artifacts import ArtifactDescriptor
 from rcm.proxy import (
+    ConnectorContext,
     ProxyError,
     ProxyTool,
     RemoteServerMetadata,
@@ -40,6 +43,8 @@ from rcm.proxy import (
     _copy_http_file,
     _copy_ssh_file,
     _file_path_from_uri,
+    _monitor_tunneled_target,
+    _prepare_target,
     _read_remote_metadata,
     _remote_sync_spec,
     _resolve_remote_target,
@@ -48,6 +53,7 @@ from rcm.proxy import (
 from rcm.server import build_proxy_server, build_server
 from rcm.store import Store
 from rcm.sync import SyncError
+from rcm.tunnel import OriginLockedAsyncTransport
 
 
 class FakeClient:
@@ -143,6 +149,32 @@ async def test_proxy_tool_blocks_call_when_sync_fails() -> None:
     with pytest.raises(Exception, match="sync failed"):
         await tool.run({})
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_proxy_tool_reports_tunneled_connection_failure() -> None:
+    failures: list[Exception] = []
+
+    class FailingClient:
+        async def call_tool_mcp(self, name: str, arguments: dict):
+            raise RuntimeError("connection lost")
+
+    tool = ProxyTool(
+        public_name="compile__build",
+        target_name="compile",
+        remote_name="build",
+        description=None,
+        parameters={"type": "object", "properties": {}},
+        output_schema=None,
+        client=FailingClient(),
+        sync=None,
+        failure_reporter=failures.append,
+    )
+
+    with pytest.raises(Exception, match="connection lost"):
+        await tool.run({})
+    assert len(failures) == 1
+    assert str(failures[0]) == "connection lost"
 
 
 @pytest.mark.asyncio
@@ -510,6 +542,165 @@ async def test_remote_http_config_resolves_without_stdio_discovery(
 
 
 @pytest.mark.asyncio
+async def test_remote_http_tunnel_resolves_internal_listener(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rcm.proxy as proxy_module
+
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="remote",
+        ssh=SSHSpec(host="compile-machine", tunnel=True),
+        remote_config=RemoteConfigSpec(path="/etc/rcm/commands.yaml"),
+        sync=SyncSpec(enabled=False),
+    )
+
+    async def fake_read(_: ProxyTargetSpec) -> RemoteServerMetadata:
+        return RemoteServerMetadata(
+            transport="http",
+            public_base_url="https://public.example/rcm",
+            api_key="remote-key",
+            host="0.0.0.0",
+            port=8123,
+            tls_enabled=False,
+        )
+
+    monkeypatch.setattr(proxy_module, "_read_remote_metadata", fake_read)
+    monkeypatch.chdir(tmp_path)
+
+    resolved = await _resolve_remote_target(target)
+
+    assert resolved.transport == "http"
+    assert resolved.endpoint == "http://127.0.0.1:8123/mcp"
+    assert resolved.ssh is not None and resolved.ssh.tunnel is True
+    assert resolved.headers["Authorization"].value == "Bearer remote-key"
+    assert resolved.artifacts == "localize"
+
+
+@pytest.mark.asyncio
+async def test_tunnel_connector_uses_internal_endpoint_and_unix_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rcm.proxy as proxy_module
+
+    tunnel_closed = False
+    socket_path = tmp_path / "http.sock"
+
+    class FakeTunnel:
+        def __init__(self, ssh_host, binding) -> None:
+            assert ssh_host == "compile-machine"
+            assert binding.base_url == "http://127.0.0.1:8123"
+            self.socket_path = socket_path
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            nonlocal tunnel_closed
+            tunnel_closed = True
+
+        async def wait(self) -> None:
+            await asyncio.Future()
+
+    monkeypatch.setattr(proxy_module, "SSHTunnel", FakeTunnel)
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="http",
+        endpoint="http://127.0.0.1:8123/mcp",
+        ssh=SSHSpec(host="compile-machine", tunnel=True),
+    )
+    metadata = RemoteServerMetadata(
+        transport="http",
+        public_base_url="https://public.example/rcm",
+        host="0.0.0.0",
+        port=8123,
+    )
+
+    async with AsyncExitStack() as stack:
+        prepared = await _prepare_target(
+            ConnectorContext(target=target, metadata=metadata),
+            stack,
+        )
+        assert isinstance(prepared.transport, StreamableHttpTransport)
+        assert prepared.transport.url == "http://127.0.0.1:8123/mcp"
+        assert prepared.transport.httpx_client_factory is not None
+        client = prepared.transport.httpx_client_factory()
+        try:
+            assert isinstance(client._transport, OriginLockedAsyncTransport)
+        finally:
+            await client.aclose()
+
+    assert tunnel_closed is True
+
+
+@pytest.mark.asyncio
+async def test_proxy_runtime_wraps_initial_connection_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rcm.proxy as proxy_module
+
+    class FailingClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            raise RuntimeError("connection refused")
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            pass
+
+    monkeypatch.setattr(proxy_module, "Client", FailingClient)
+    cfg = Config(
+        server=ServerSpec(),
+        auth=AuthSpec(),
+        defaults=DefaultsSpec(),
+        commands=[],
+        proxy=ProxySpec(
+            targets=[
+                ProxyTargetSpec(
+                    name="remote",
+                    transport="stdio",
+                    command=["unused"],
+                )
+            ]
+        ),
+    )
+
+    with pytest.raises(ProxyError, match="failed to connect: connection refused"):
+        await build_proxy_server(
+            cfg,
+            Store(tmp_path / "runs", (tmp_path / "runs").as_uri()),
+            None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_remote_stdio_config_rejects_ssh_tunnel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rcm.proxy as proxy_module
+
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="remote",
+        ssh=SSHSpec(host="compile-machine", tunnel=True),
+        remote_config=RemoteConfigSpec(path="/etc/rcm/commands.yaml"),
+        sync=SyncSpec(enabled=False),
+    )
+
+    async def fake_read(_: ProxyTargetSpec) -> RemoteServerMetadata:
+        return RemoteServerMetadata(transport="stdio")
+
+    monkeypatch.setattr(proxy_module, "_read_remote_metadata", fake_read)
+
+    with pytest.raises(ProxyError, match="requires.*HTTP"):
+        await _resolve_remote_target(target)
+
+
+@pytest.mark.asyncio
 async def test_remote_config_metadata_uses_explicit_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -546,6 +737,115 @@ async def test_remote_config_metadata_uses_explicit_transport(
     assert metadata.public_base_url == "https://compile.example.com"
     assert metadata.api_key == "remote-key"
     assert metadata.cwd == "/srv/project"
+
+
+@pytest.mark.asyncio
+async def test_remote_config_metadata_reads_tunnel_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rcm.proxy as proxy_module
+
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="remote",
+        ssh=SSHSpec(host="compile-machine", tunnel=True),
+        remote_config=RemoteConfigSpec(path="/etc/rcm/commands.yaml"),
+    )
+
+    async def fake_ssh(_: str, command: str) -> tuple[int, str, str]:
+        return (
+            0,
+            """
+            server:
+              transport: http
+              host: '::'
+              port: 8443
+              public_base_url: https://public.example/rcm
+              tls:
+                enabled: true
+            """,
+            "",
+        )
+
+    monkeypatch.setattr(proxy_module, "_ssh_command", fake_ssh)
+
+    metadata = await _read_remote_metadata(target)
+
+    assert metadata.host == "::"
+    assert metadata.port == 8443
+    assert metadata.tls_enabled is True
+
+
+@pytest.mark.parametrize(
+    "listener_yaml, fragment",
+    [
+        ("host: ''", "server.host"),
+        ("port: true", "server.port"),
+        ("port: 65536", "server.port"),
+        ("tls: []", "server.tls"),
+        ("tls: {enabled: yes-please}", "server.tls.enabled"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_remote_config_metadata_rejects_invalid_tunnel_listener(
+    listener_yaml: str,
+    fragment: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rcm.proxy as proxy_module
+
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="remote",
+        ssh=SSHSpec(host="compile-machine", tunnel=True),
+        remote_config=RemoteConfigSpec(path="/etc/rcm/commands.yaml"),
+    )
+
+    async def fake_ssh(_: str, command: str) -> tuple[int, str, str]:
+        return (
+            0,
+            "server:\n"
+            "  transport: http\n"
+            "  public_base_url: https://public.example/rcm\n"
+            f"  {listener_yaml}\n",
+            "",
+        )
+
+    monkeypatch.setattr(proxy_module, "_ssh_command", fake_ssh)
+
+    with pytest.raises(ProxyError) as exc_info:
+        await _read_remote_metadata(target)
+    assert fragment in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_tunnel_monitor_requires_two_consecutive_ping_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rcm.proxy as proxy_module
+
+    monkeypatch.setattr(proxy_module, "TUNNEL_PING_INTERVAL", 0.001)
+    monkeypatch.setattr(proxy_module, "TUNNEL_PING_TIMEOUT", 0.1)
+
+    class PingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ping(self) -> bool:
+            self.calls += 1
+            if self.calls in {1, 3}:
+                return False
+            if self.calls == 4:
+                raise RuntimeError("unhealthy")
+            return True
+
+    async def tunnel_wait() -> None:
+        await asyncio.Future()
+
+    client = PingClient()
+    with pytest.raises(ProxyError, match="2 consecutive"):
+        await _monitor_tunneled_target(client, tunnel_wait)
+    assert client.calls == 4
 
 
 @pytest.mark.asyncio

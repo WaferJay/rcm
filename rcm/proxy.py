@@ -14,7 +14,7 @@ import shutil
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Awaitable, Callable, Mapping, Protocol
 from urllib.parse import unquote_to_bytes, urlsplit
 
 import httpx
@@ -22,6 +22,7 @@ import yaml
 
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import (
+    ClientTransport,
     SSETransport,
     StdioTransport,
     StreamableHttpTransport,
@@ -57,6 +58,14 @@ from .config import (
 )
 from .store import Store, StoreError
 from .sync import SyncError, SyncRunner
+from .tunnel import (
+    ArtifactRoute,
+    OriginLockedAsyncTransport,
+    SSHTunnel,
+    TunnelError,
+    derive_remote_http_binding,
+    uds_http_client_factory,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +81,9 @@ class RemoteServerMetadata:
     public_base_url: str | None = None
     api_key: str | None = None
     cwd: str | None = None
+    host: str = "0.0.0.0"
+    port: int = 8000
+    tls_enabled: bool = False
 
 
 async def _ssh_command(host: str, command: str) -> tuple[int, str, str]:
@@ -136,7 +148,13 @@ async def _read_remote_metadata(target: ProxyTargetSpec) -> RemoteServerMetadata
         )
     if isinstance(public_base_url, str):
         public_base_url = public_base_url.strip()
-        parsed = urlsplit(public_base_url)
+        try:
+            parsed = urlsplit(public_base_url)
+            _ = parsed.port
+        except ValueError as exc:
+            raise ProxyError(
+                f"remote config {path!r}: server.public_base_url is invalid"
+            ) from exc
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ProxyError(
                 f"remote config {path!r}: server.public_base_url must be an http:// or https:// URL"
@@ -166,11 +184,51 @@ async def _read_remote_metadata(target: ProxyTargetSpec) -> RemoteServerMetadata
     if isinstance(cwd, str):
         cwd = cwd.strip()
 
+    host = "0.0.0.0"
+    port = 8000
+    tls_enabled = False
+    if target.ssh.tunnel:
+        host_raw = server_raw.get("host")
+        if host_raw is not None:
+            if not isinstance(host_raw, str) or not host_raw.strip():
+                raise ProxyError(
+                    f"remote config {path!r}: server.host must be a non-empty string"
+                )
+            host = host_raw.strip()
+
+        port_raw = server_raw.get("port")
+        if port_raw is not None:
+            if (
+                isinstance(port_raw, bool)
+                or not isinstance(port_raw, int)
+                or not 1 <= port_raw <= 65535
+            ):
+                raise ProxyError(
+                    f"remote config {path!r}: server.port must be an integer "
+                    "between 1 and 65535"
+                )
+            port = port_raw
+
+        tls_raw = server_raw.get("tls")
+        if tls_raw is None:
+            tls_raw = {}
+        if not isinstance(tls_raw, dict):
+            raise ProxyError(f"remote config {path!r}: server.tls must be a mapping")
+        tls_enabled_raw = tls_raw.get("enabled", False)
+        if not isinstance(tls_enabled_raw, bool):
+            raise ProxyError(
+                f"remote config {path!r}: server.tls.enabled must be a boolean"
+            )
+        tls_enabled = tls_enabled_raw
+
     return RemoteServerMetadata(
         transport=transport,
         public_base_url=public_base_url,
         api_key=api_key,
         cwd=cwd,
+        host=host,
+        port=port,
+        tls_enabled=tls_enabled,
     )
 
 
@@ -253,9 +311,13 @@ def _remote_sync_spec(
     )
 
 
-async def _resolve_remote_target(target: ProxyTargetSpec) -> ProxyTargetSpec:
+async def _resolve_remote_target_context(
+    target: ProxyTargetSpec,
+) -> tuple[ProxyTargetSpec, RemoteServerMetadata]:
     if target.remote_config is None or target.ssh is None:
-        raise ProxyError(f"proxy target {target.name!r} is missing remote config or SSH")
+        raise ProxyError(
+            f"proxy target {target.name!r} is missing remote config or SSH"
+        )
 
     metadata = await _read_remote_metadata(target)
     sync = _remote_sync_spec(target, target.remote_config, metadata)
@@ -270,13 +332,44 @@ async def _resolve_remote_target(target: ProxyTargetSpec) -> ProxyTargetSpec:
             name.lower() == "authorization" for name in headers
         ):
             headers["Authorization"] = HeaderSpec(value=f"Bearer {metadata.api_key}")
+        endpoint = _remote_http_endpoint(metadata.public_base_url)
+        artifacts = target.artifacts
+        if target.ssh.tunnel:
+            if target.artifacts == "passthrough":
+                raise ProxyError(
+                    f"proxy target {target.name!r}: artifact passthrough is not "
+                    "supported with an SSH tunnel"
+                )
+            try:
+                binding = derive_remote_http_binding(
+                    metadata.host,
+                    metadata.port,
+                    tls_enabled=metadata.tls_enabled,
+                )
+                endpoint = ArtifactRoute.create(
+                    metadata.public_base_url,
+                    binding,
+                ).mcp_endpoint
+            except TunnelError as exc:
+                raise ProxyError(
+                    f"proxy target {target.name!r}: invalid SSH tunnel "
+                    f"configuration: {exc}"
+                ) from exc
+            artifacts = artifacts or "localize"
         return replace(
             target,
             transport="http",
-            endpoint=_remote_http_endpoint(metadata.public_base_url),
+            endpoint=endpoint,
             headers=headers,
             sync=sync,
             remote_config=None,
+            artifacts=artifacts,
+        ), metadata
+
+    if target.ssh.tunnel:
+        raise ProxyError(
+            f"proxy target {target.name!r}: ssh.tunnel requires the remote "
+            "server transport to be HTTP"
         )
 
     command = await _discover_remote_stdio_command(target.ssh.host)
@@ -285,7 +378,12 @@ async def _resolve_remote_target(target: ProxyTargetSpec) -> ProxyTargetSpec:
         transport="ssh",
         ssh=replace(target.ssh, command=command),
         sync=sync,
-    )
+    ), metadata
+
+
+async def _resolve_remote_target(target: ProxyTargetSpec) -> ProxyTargetSpec:
+    resolved, _ = await _resolve_remote_target_context(target)
+    return resolved
 
 
 def _resolve_headers(
@@ -306,41 +404,6 @@ def _resolve_headers(
             )
         resolved[name] = value
     return resolved
-
-
-def _build_transport(target: ProxyTargetSpec):
-    if target.transport == "stdio":
-        assert target.command is not None
-        return StdioTransport(
-            command=target.command[0],
-            args=target.command[1:],
-            cwd=target.cwd,
-            env=dict(os.environ),
-        )
-
-    if target.transport == "ssh":
-        assert target.ssh is not None
-        if target.ssh.command is None:
-            raise ProxyError(f"proxy target {target.name!r} has no SSH command")
-        remote_args: list[str] = []
-        if target.remote_config is not None:
-            remote_args.extend(
-                ["env", f"RCM_CONFIG={shlex.quote(target.remote_config.path)}"]
-            )
-        return StdioTransport(
-            command="ssh",
-            args=[
-                target.ssh.host,
-                *remote_args,
-                *target.ssh.command,
-            ],
-        )
-
-    assert target.endpoint is not None
-    headers = _resolve_headers(target)
-    if target.transport == "http":
-        return StreamableHttpTransport(target.endpoint, headers=headers)
-    return SSETransport(target.endpoint, headers=headers)
 
 
 def _supports_rcm_v2(client: Client) -> bool:
@@ -535,6 +598,314 @@ async def _copy_http_file(
     _validate_transfer(descriptor, size, digest.hexdigest())
 
 
+class ArtifactFetcher(Protocol):
+    """Copy a validated remote artifact into local staging storage."""
+
+    async def copy(
+        self,
+        artifact: str,
+        run_id: str,
+        descriptor: ArtifactDescriptor,
+        destination: Path,
+    ) -> None: ...
+
+
+class DirectHttpArtifactFetcher:
+    async def copy(
+        self,
+        artifact: str,
+        run_id: str,
+        descriptor: ArtifactDescriptor,
+        destination: Path,
+    ) -> None:
+        await _copy_http_file(destination, descriptor)
+
+
+class TunneledHttpArtifactFetcher:
+    def __init__(self, route: ArtifactRoute, socket_path: Path) -> None:
+        self._route = route
+        self._socket_path = socket_path
+
+    async def copy(
+        self,
+        artifact: str,
+        run_id: str,
+        descriptor: ArtifactDescriptor,
+        destination: Path,
+    ) -> None:
+        try:
+            uri = self._route.artifact_url(
+                descriptor.uri,
+                run_id=run_id,
+                artifact=artifact,
+            )
+        except TunnelError as exc:
+            raise ArtifactError(str(exc)) from exc
+        internal = replace(descriptor, uri=uri)
+        await _copy_http_file(
+            destination,
+            internal,
+            transport=OriginLockedAsyncTransport(
+                self._route.internal_origin,
+                self._socket_path,
+                tls_server_name=self._route.tls_server_name,
+            ),
+        )
+
+
+class LocalFileArtifactFetcher:
+    async def copy(
+        self,
+        artifact: str,
+        run_id: str,
+        descriptor: ArtifactDescriptor,
+        destination: Path,
+    ) -> None:
+        source = _file_path_from_uri(descriptor.uri)
+        await asyncio.to_thread(_copy_local_file, source, destination, descriptor)
+
+
+class SSHFileArtifactFetcher:
+    def __init__(self, host: str) -> None:
+        self._host = host
+
+    async def copy(
+        self,
+        artifact: str,
+        run_id: str,
+        descriptor: ArtifactDescriptor,
+        destination: Path,
+    ) -> None:
+        source = _file_path_from_uri(descriptor.uri)
+        await _copy_ssh_file(self._host, source, destination, descriptor)
+
+
+class SchemeArtifactFetcher:
+    """Dispatch artifact schemes to injected fetch strategies."""
+
+    def __init__(self, fetchers: Mapping[str, ArtifactFetcher]) -> None:
+        self._fetchers = dict(fetchers)
+
+    async def copy(
+        self,
+        artifact: str,
+        run_id: str,
+        descriptor: ArtifactDescriptor,
+        destination: Path,
+    ) -> None:
+        try:
+            scheme = urlsplit(descriptor.uri).scheme.lower()
+        except ValueError as exc:
+            raise ArtifactError("artifact URI is invalid") from exc
+        fetcher = self._fetchers.get(scheme)
+        if fetcher is None:
+            raise ArtifactError(f"unsupported artifact URI scheme {scheme!r}")
+        await fetcher.copy(artifact, run_id, descriptor, destination)
+
+
+def _standard_artifact_fetcher(
+    transport: str,
+    ssh_host: str | None = None,
+) -> ArtifactFetcher:
+    http = DirectHttpArtifactFetcher()
+    fetchers: dict[str, ArtifactFetcher] = {"http": http, "https": http}
+    if transport == "stdio":
+        fetchers["file"] = LocalFileArtifactFetcher()
+    elif transport == "ssh" and ssh_host is not None:
+        fetchers["file"] = SSHFileArtifactFetcher(ssh_host)
+    return SchemeArtifactFetcher(fetchers)
+
+
+@dataclass(frozen=True)
+class ConnectorContext:
+    target: ProxyTargetSpec
+    metadata: RemoteServerMetadata | None = None
+
+
+@dataclass(frozen=True)
+class PreparedTarget:
+    transport: ClientTransport
+    artifact_fetcher: ArtifactFetcher
+    monitor: Callable[[], Awaitable[None]] | None = None
+
+
+class TargetConnector(Protocol):
+    async def prepare(
+        self,
+        context: ConnectorContext,
+        stack: AsyncExitStack,
+    ) -> PreparedTarget: ...
+
+
+class StdioConnector:
+    async def prepare(
+        self,
+        context: ConnectorContext,
+        stack: AsyncExitStack,
+    ) -> PreparedTarget:
+        target = context.target
+        if not target.command:
+            raise ProxyError(f"proxy target {target.name!r} has no stdio command")
+        return PreparedTarget(
+            transport=StdioTransport(
+                command=target.command[0],
+                args=target.command[1:],
+                cwd=target.cwd,
+                env=dict(os.environ),
+            ),
+            artifact_fetcher=_standard_artifact_fetcher("stdio"),
+        )
+
+
+class SSHStdioConnector:
+    async def prepare(
+        self,
+        context: ConnectorContext,
+        stack: AsyncExitStack,
+    ) -> PreparedTarget:
+        target = context.target
+        if target.ssh is None or target.ssh.command is None:
+            raise ProxyError(f"proxy target {target.name!r} has no SSH command")
+        remote_args: list[str] = []
+        if target.remote_config is not None:
+            remote_args.extend(
+                ["env", f"RCM_CONFIG={shlex.quote(target.remote_config.path)}"]
+            )
+        return PreparedTarget(
+            transport=StdioTransport(
+                command="ssh",
+                args=[
+                    target.ssh.host,
+                    *remote_args,
+                    *target.ssh.command,
+                ],
+            ),
+            artifact_fetcher=_standard_artifact_fetcher(
+                "ssh",
+                target.ssh.host,
+            ),
+        )
+
+
+class DirectHttpConnector:
+    async def prepare(
+        self,
+        context: ConnectorContext,
+        stack: AsyncExitStack,
+    ) -> PreparedTarget:
+        target = context.target
+        if target.endpoint is None:
+            raise ProxyError(f"proxy target {target.name!r} has no HTTP endpoint")
+        return PreparedTarget(
+            transport=StreamableHttpTransport(
+                target.endpoint,
+                headers=_resolve_headers(target),
+            ),
+            artifact_fetcher=_standard_artifact_fetcher("http"),
+        )
+
+
+class SSEConnector:
+    async def prepare(
+        self,
+        context: ConnectorContext,
+        stack: AsyncExitStack,
+    ) -> PreparedTarget:
+        target = context.target
+        if target.endpoint is None:
+            raise ProxyError(f"proxy target {target.name!r} has no SSE endpoint")
+        return PreparedTarget(
+            transport=SSETransport(
+                target.endpoint,
+                headers=_resolve_headers(target),
+            ),
+            artifact_fetcher=_standard_artifact_fetcher("sse"),
+        )
+
+
+class SSHTunnelHttpConnector:
+    async def prepare(
+        self,
+        context: ConnectorContext,
+        stack: AsyncExitStack,
+    ) -> PreparedTarget:
+        target = context.target
+        metadata = context.metadata
+        if target.ssh is None or not target.ssh.tunnel or metadata is None:
+            raise ProxyError(f"proxy target {target.name!r} has no SSH tunnel metadata")
+        if metadata.public_base_url is None:
+            raise ProxyError(
+                f"proxy target {target.name!r} has no remote public_base_url"
+            )
+        try:
+            binding = derive_remote_http_binding(
+                metadata.host,
+                metadata.port,
+                tls_enabled=metadata.tls_enabled,
+            )
+            route = ArtifactRoute.create(metadata.public_base_url, binding)
+            tunnel = await stack.enter_async_context(
+                SSHTunnel(target.ssh.host, binding)
+            )
+        except TunnelError as exc:
+            raise ProxyError(
+                f"proxy target {target.name!r}: failed to establish SSH tunnel: {exc}"
+            ) from exc
+        socket_path = tunnel.socket_path
+        if socket_path is None:
+            raise ProxyError(
+                f"proxy target {target.name!r}: SSH tunnel has no socket path"
+            )
+        tunneled_fetcher = TunneledHttpArtifactFetcher(route, socket_path)
+        return PreparedTarget(
+            transport=StreamableHttpTransport(
+                route.mcp_endpoint,
+                headers=_resolve_headers(target),
+                httpx_client_factory=uds_http_client_factory(
+                    route.internal_origin,
+                    socket_path,
+                    tls_server_name=route.tls_server_name,
+                ),
+            ),
+            artifact_fetcher=SchemeArtifactFetcher(
+                {
+                    "http": tunneled_fetcher,
+                    "https": tunneled_fetcher,
+                }
+            ),
+            monitor=tunnel.wait,
+        )
+
+
+TARGET_CONNECTORS: Mapping[str, TargetConnector] = {
+    "stdio": StdioConnector(),
+    "ssh": SSHStdioConnector(),
+    "http": DirectHttpConnector(),
+    "sse": SSEConnector(),
+    "ssh-tunnel-http": SSHTunnelHttpConnector(),
+}
+
+
+async def _prepare_target(
+    context: ConnectorContext,
+    stack: AsyncExitStack,
+) -> PreparedTarget:
+    target = context.target
+    key = (
+        "ssh-tunnel-http"
+        if target.transport == "http"
+        and target.ssh is not None
+        and target.ssh.tunnel
+        else target.transport
+    )
+    connector = TARGET_CONNECTORS.get(key)
+    if connector is None:
+        raise ProxyError(
+            f"proxy target {target.name!r} uses unsupported connector {key!r}"
+        )
+    return await connector.prepare(context, stack)
+
+
 class ProxyTool(Tool):
     """A FastMCP tool that syncs and forwards one remote MCP tool call."""
 
@@ -547,6 +918,8 @@ class ProxyTool(Tool):
     _ssh_host: str | None = PrivateAttr()
     _artifact_mode: str = PrivateAttr()
     _rcm_peer: bool = PrivateAttr()
+    _artifact_fetcher: ArtifactFetcher = PrivateAttr()
+    _failure_reporter: Callable[[Exception], None] | None = PrivateAttr()
 
     def __init__(
         self,
@@ -564,6 +937,8 @@ class ProxyTool(Tool):
         ssh_host: str | None = None,
         artifact_mode: str = DEFAULT_ARTIFACT_MODE,
         rcm_peer: bool = False,
+        artifact_fetcher: ArtifactFetcher | None = None,
+        failure_reporter: Callable[[Exception], None] | None = None,
     ) -> None:
         super().__init__(
             name=public_name,
@@ -580,6 +955,11 @@ class ProxyTool(Tool):
         self._ssh_host = ssh_host
         self._artifact_mode = artifact_mode
         self._rcm_peer = rcm_peer
+        self._artifact_fetcher = artifact_fetcher or _standard_artifact_fetcher(
+            target_transport,
+            ssh_host,
+        )
+        self._failure_reporter = failure_reporter
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         if self._sync_runner is not None:
@@ -596,6 +976,8 @@ class ProxyTool(Tool):
                 self._remote_name, arguments or {}, **call_kwargs
             )
         except Exception as exc:
+            if self._failure_reporter is not None:
+                self._failure_reporter(exc)
             raise ToolError(
                 f"proxy target {self._target_name!r} tool "
                 f"{self._remote_name!r} failed: {exc}"
@@ -654,29 +1036,17 @@ class ProxyTool(Tool):
                 )
 
     async def _copy_artifact(
-        self, descriptor: ArtifactDescriptor, destination: Path
+        self,
+        artifact: str,
+        run_id: str,
+        descriptor: ArtifactDescriptor,
+        destination: Path,
     ) -> None:
-        try:
-            scheme = urlsplit(descriptor.uri).scheme.lower()
-        except ValueError as exc:
-            raise ArtifactError("artifact URI is invalid") from exc
-        if scheme in {"http", "https"}:
-            await _copy_http_file(destination, descriptor)
-            return
-        if scheme != "file":
-            raise ArtifactError(f"unsupported artifact URI scheme {scheme!r}")
-
-        source = _file_path_from_uri(descriptor.uri)
-        if self._target_transport == "stdio":
-            await asyncio.to_thread(_copy_local_file, source, destination, descriptor)
-            return
-        if self._target_transport == "ssh":
-            if self._ssh_host is None:
-                raise ArtifactError("SSH artifact received without an SSH host")
-            await _copy_ssh_file(self._ssh_host, source, destination, descriptor)
-            return
-        raise ArtifactError(
-            f"{self._target_transport} RCM target returned an inaccessible file URI"
+        await self._artifact_fetcher.copy(
+            artifact,
+            run_id,
+            descriptor,
+            destination,
         )
 
     async def _materialize_artifact(self, remote: RunResult) -> dict[str, Any]:
@@ -686,6 +1056,8 @@ class ProxyTool(Tool):
         try:
             for name, descriptor in remote.artifacts.items():
                 await self._copy_artifact(
+                    name,
+                    remote.run_id,
                     descriptor,
                     staging / ARTIFACT_KINDS[name].filename,
                 )
@@ -724,9 +1096,17 @@ class ProxyTool(Tool):
 class ProxyRuntime:
     """Own connected remote clients and the locally registered proxy tools."""
 
-    def __init__(self, server: FastMCP, stack: AsyncExitStack) -> None:
+    def __init__(
+        self,
+        server: FastMCP,
+        stack: AsyncExitStack,
+        failure: asyncio.Future[ProxyError],
+        monitor_tasks: list[asyncio.Task[None]],
+    ) -> None:
         self.server = server
         self._stack = stack
+        self._failure = failure
+        self._monitor_tasks = monitor_tasks
 
     @classmethod
     async def create(
@@ -746,13 +1126,29 @@ class ProxyRuntime:
         if api_key is not None:
             server.add_middleware(ApiKeyAuth(api_key))
         stack = AsyncExitStack()
+        failure: asyncio.Future[ProxyError] = (
+            asyncio.get_running_loop().create_future()
+        )
+        monitor_tasks: list[asyncio.Task[None]] = []
+
+        def report_failure(target_name: str, exc: Exception) -> None:
+            if failure.done():
+                return
+            failure.set_result(
+                ProxyError(
+                    f"proxy target {target_name!r} connection failed: {exc}"
+                )
+            )
+
         try:
             for configured_target in cfg.proxy.targets:
-                target = (
-                    await _resolve_remote_target(configured_target)
-                    if configured_target.remote_config is not None
-                    else configured_target
-                )
+                metadata = None
+                if configured_target.remote_config is not None:
+                    target, metadata = await _resolve_remote_target_context(
+                        configured_target
+                    )
+                else:
+                    target = configured_target
                 if (
                     target.artifacts == "passthrough"
                     and target.transport != "http"
@@ -779,13 +1175,25 @@ class ProxyRuntime:
                     raise ProxyError(
                         f"invalid sync configuration for target {target.name!r}: {exc}"
                     ) from exc
-                client = await stack.enter_async_context(
-                    Client(
-                        _build_transport(target),
-                        name=f"rcm-proxy-{target.name}",
-                        client_info=Implementation(name="rcm", version=__version__),
-                    )
+                prepared = await _prepare_target(
+                    ConnectorContext(target=target, metadata=metadata),
+                    stack,
                 )
+                try:
+                    client = await stack.enter_async_context(
+                        Client(
+                            prepared.transport,
+                            name=f"rcm-proxy-{target.name}",
+                            client_info=Implementation(
+                                name="rcm",
+                                version=__version__,
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    raise ProxyError(
+                        f"proxy target {target.name!r} failed to connect: {exc}"
+                    ) from exc
                 rcm_peer = _supports_rcm_v2(client)
                 if configured_target.remote_config is not None and not rcm_peer:
                     raise ProxyError(
@@ -798,7 +1206,18 @@ class ProxyRuntime:
                         "the target is not an RCM v2 server"
                     )
                 artifact_mode = target.artifacts or DEFAULT_ARTIFACT_MODE
-                remote_tools = await client.list_tools()
+                try:
+                    remote_tools = await client.list_tools()
+                except Exception as exc:
+                    raise ProxyError(
+                        f"proxy target {target.name!r} failed to discover tools: {exc}"
+                    ) from exc
+                failure_reporter = None
+                if prepared.monitor is not None:
+                    failure_reporter = lambda exc, name=target.name: report_failure(
+                        name,
+                        exc,
+                    )
                 for remote_tool in remote_tools:
                     remote_name = remote_tool.name
                     public_name = f"{target.name}__{remote_name}"
@@ -820,15 +1239,102 @@ class ProxyRuntime:
                             sync=sync_runner,
                             store=store,
                             target_transport=target.transport,
-                            ssh_host=(target.ssh.host if target.ssh is not None else None),
+                            ssh_host=(
+                                target.ssh.host if target.ssh is not None else None
+                            ),
                             artifact_mode=artifact_mode,
                             rcm_peer=rcm_peer,
+                            artifact_fetcher=prepared.artifact_fetcher,
+                            failure_reporter=failure_reporter,
                         )
                     )
-        except Exception:
+                if prepared.monitor is not None:
+                    monitor_tasks.append(
+                        asyncio.create_task(
+                            _run_target_monitor(
+                                target.name,
+                                client,
+                                prepared.monitor,
+                                report_failure,
+                            )
+                        )
+                    )
+        except BaseException:
+            await _cancel_tasks(monitor_tasks)
             await stack.aclose()
             raise
-        return cls(server, stack)
+        return cls(server, stack, failure, monitor_tasks)
+
+    async def wait_failure(self) -> ProxyError:
+        """Wait until a monitored target requires the proxy to terminate."""
+        return await asyncio.shield(self._failure)
 
     async def close(self) -> None:
+        await _cancel_tasks(self._monitor_tasks)
+        self._monitor_tasks.clear()
         await self._stack.aclose()
+
+
+TUNNEL_PING_INTERVAL = 30.0
+TUNNEL_PING_TIMEOUT = 10.0
+TUNNEL_PING_FAILURE_LIMIT = 2
+
+
+async def _cancel_tasks(tasks: list[asyncio.Task[Any]]) -> None:
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _monitor_tunneled_target(
+    client: Client,
+    wait_for_tunnel: Callable[[], Awaitable[None]],
+) -> None:
+    tunnel_task = asyncio.create_task(wait_for_tunnel())
+    ping_failures = 0
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                {tunnel_task},
+                timeout=TUNNEL_PING_INTERVAL,
+            )
+            if tunnel_task in done:
+                await tunnel_task
+                raise ProxyError("SSH tunnel monitor stopped unexpectedly")
+            try:
+                healthy = await asyncio.wait_for(
+                    client.ping(),
+                    timeout=TUNNEL_PING_TIMEOUT,
+                )
+                if not healthy:
+                    raise ProxyError("remote MCP ping returned an unhealthy response")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                ping_failures += 1
+                if ping_failures >= TUNNEL_PING_FAILURE_LIMIT:
+                    raise ProxyError(
+                        f"remote MCP ping failed {ping_failures} consecutive "
+                        f"times: {exc}"
+                    ) from exc
+            else:
+                ping_failures = 0
+    finally:
+        if not tunnel_task.done():
+            tunnel_task.cancel()
+        await asyncio.gather(tunnel_task, return_exceptions=True)
+
+
+async def _run_target_monitor(
+    target_name: str,
+    client: Client,
+    wait_for_tunnel: Callable[[], Awaitable[None]],
+    reporter: Callable[[str, Exception], None],
+) -> None:
+    try:
+        await _monitor_tunneled_target(client, wait_for_tunnel)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        reporter(target_name, exc)

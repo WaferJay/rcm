@@ -10,7 +10,7 @@ import os
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Coroutine
 from urllib.parse import urlsplit
 
 from fastmcp import FastMCP
@@ -214,6 +214,47 @@ def build_http_app(mcp: FastMCP, cfg: Config, api_key: str) -> Any:
     return mcp.http_app()
 
 
+PROXY_SHUTDOWN_TIMEOUT = 10.0
+
+
+async def _run_proxy_service(
+    service: Coroutine[Any, Any, None],
+    runtime: ProxyRuntime,
+    *,
+    request_stop: Callable[[], None] | None = None,
+) -> None:
+    """Run a proxy server until it exits or a monitored target fails."""
+    service_task = asyncio.create_task(service)
+    failure_task = asyncio.create_task(runtime.wait_failure())
+    try:
+        done, _ = await asyncio.wait(
+            {service_task, failure_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if service_task in done:
+            return await service_task
+
+        failure = await failure_task
+        if request_stop is None:
+            service_task.cancel()
+        else:
+            request_stop()
+        stopped, _ = await asyncio.wait(
+            {service_task},
+            timeout=PROXY_SHUTDOWN_TIMEOUT,
+        )
+        if service_task not in stopped:
+            service_task.cancel()
+        await asyncio.gather(service_task, return_exceptions=True)
+        raise failure
+    finally:
+        failure_task.cancel()
+        await asyncio.gather(failure_task, return_exceptions=True)
+        if not service_task.done():
+            service_task.cancel()
+            await asyncio.gather(service_task, return_exceptions=True)
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -327,7 +368,10 @@ def main() -> None:
             runtime: ProxyRuntime | None = None
             try:
                 mcp, runtime = await build_proxy_server(cfg, store, api_key=None)
-                await mcp.run_async(transport="stdio")
+                await _run_proxy_service(
+                    mcp.run_async(transport="stdio"),
+                    runtime,
+                )
             finally:
                 if runtime is not None:
                     await runtime.close()
@@ -335,7 +379,7 @@ def main() -> None:
         try:
             asyncio.run(serve_proxy_stdio())
         except ProxyError as e:
-            sys.exit(f"rcm: failed to configure proxy: {e}")
+            sys.exit(f"rcm: proxy failed: {e}")
         return
 
     host = os.environ.get("RCM_HOST") or cfg.server.host or "0.0.0.0"
@@ -380,7 +424,11 @@ def main() -> None:
                     **uvicorn_config,
                 )
             )
-            await server.serve()
+            await _run_proxy_service(
+                server.serve(),
+                runtime,
+                request_stop=lambda: setattr(server, "should_exit", True),
+            )
         finally:
             if runtime is not None:
                 await runtime.close()
@@ -388,4 +436,4 @@ def main() -> None:
     try:
         asyncio.run(serve_proxy())
     except ProxyError as e:
-        sys.exit(f"rcm: failed to configure proxy: {e}")
+        sys.exit(f"rcm: proxy failed: {e}")

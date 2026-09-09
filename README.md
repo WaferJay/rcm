@@ -176,6 +176,8 @@ proxy:
   remote_compile:
     ssh:
       host: compile-machine
+      # Optional, POSIX only: route the discovered HTTP RCM through SSH.
+      tunnel: true
     config: /etc/rcm/commands.yaml
     sync:
       mappings:
@@ -212,11 +214,34 @@ error, while `value` permits a directly configured header value.
 The server's own transport is selected explicitly with `server.transport`.
 It defaults to `http` for compatibility with existing configurations. A
 proxy target can instead use `ssh` plus an absolute remote `config` path. rcm
-reads that file over SSH and inspects its `server.transport`: for `http`, it
-connects directly to the remote `server.public_base_url` and does not start a
-remote rcm process; for `stdio`, it starts `rcm --stdio`, falling back to
-`uvx rcm --stdio` when `rcm` is not on the remote PATH. HTTP connection errors
-are returned as errors and do not fall back to stdio.
+reads that file over SSH and inspects its `server.transport`. For `http`, the
+default is to connect directly to the remote `server.public_base_url` without
+starting another rcm process. For `stdio`, it starts `rcm --stdio`, falling back
+to `uvx rcm --stdio` when `rcm` is not on the remote PATH. Connection errors are
+returned as errors and do not switch transports automatically.
+
+Set `ssh.tunnel: true` on a remote-config target to connect an HTTP RCM through
+an OpenSSH Unix-socket forward. This mode is currently available on POSIX
+systems only. The tunnel destination is derived from the remote YAML's
+`server.host`, `server.port`, and `server.tls.enabled`; wildcard bind addresses
+map to the corresponding loopback address. The remote `public_base_url` remains
+the externally advertised address and is never used as the tunnel destination.
+For example, a public `https://rcm.example.com/rcm` can map to a remote-side
+`http://127.0.0.1:8000` listener.
+
+If that internal listener uses TLS, certificate verification still uses the
+hostname from `public_base_url`; the certificate must be trusted by the proxy
+host. The hostname affects TLS identity only and is not resolved or connected
+to outside the Unix-socket transport.
+
+Tunnel discovery reads the YAML values, not environment overrides applied to
+the running remote service. Keep `RCM_HOST`, `RCM_PORT`, `RCM_TLS_ENABLED`, and
+`RCM_PUBLIC_BASE_URL` consistent with the YAML for tunneled targets. If the
+remote API key exists only in its environment, configure the target's
+`Authorization` header locally.
+Tunnel setup uses non-interactive SSH authentication (`BatchMode=yes`). A lost
+tunnel or repeatedly unhealthy MCP session shuts down the complete proxy with a
+non-zero exit status so a process supervisor can restart it.
 
 Every proxied tool is exposed as `<target>__<tool>`, for example
 `compile__build`. Current rcm command tools have no additional name prefix.
@@ -262,20 +287,22 @@ RCM servers advertise the v2 artifact capability and supported artifact kinds
 during MCP initialization.
 For another RCM, `artifacts` defaults to `localize`: a local stdio proxy reads
 the returned `file://` URI directly, an SSH proxy streams the file over the
-same SSH host, and an HTTP proxy downloads the returned URL. The proxy verifies
-the declared size and SHA-256 of every returned artifact, creates a new local
-run, and returns URIs appropriate for its own server transport (`file://` for
-stdio, HTTP URLs for HTTP). Stdout, stderr, and collect use this same byte-for-byte
-copy and validation path; collect is never decompressed or recompressed by a
-proxy. No command output is embedded in the MCP tool response.
+same SSH host, and an HTTP proxy downloads the returned URL. A tunneled HTTP
+proxy validates the public artifact URL and maps it to the remote listener, so
+the MCP call and artifact bytes both stay inside the SSH connection. The proxy
+verifies the declared size and SHA-256 of every returned artifact, creates a new
+local run, and returns URIs appropriate for its own server transport (`file://`
+for stdio, HTTP URLs for HTTP). Stdout, stderr, and collect use this same
+byte-for-byte copy and validation path; collect is never decompressed or
+recompressed by a proxy. No command output is embedded in the MCP tool response.
 
 An HTTP RCM target can instead set `artifacts: passthrough`. Its run ID and
 HTTP artifact URLs are then returned without a local copy, even when the outer
-RCM uses stdio. `passthrough` is rejected for stdio, SSH, and SSE targets. An
-explicit `artifacts` setting also requires the target to identify itself as an
-RCM v2 server. Results from ordinary MCP services are always passed through
-unchanged. Targets discovered through `ssh` plus `config` are RCM-specific and
-therefore also require the remote server to support v2.
+RCM uses stdio. `passthrough` is rejected for stdio, SSH, SSE, and tunneled HTTP
+targets. An explicit `artifacts` setting also requires the target to identify
+itself as an RCM v2 server. Results from ordinary MCP services are always passed
+through unchanged. Targets discovered through `ssh` plus `config` are
+RCM-specific and therefore also require the remote server to support v2.
 
 `collect` is an additive v2 field. Proxies from before collect support continue
 to handle stdout/stderr, but may omit collect while rebuilding a localized
@@ -417,7 +444,8 @@ packages are installed and includes them. Key caveats:
 - For onefile mode, add `--onefile-tempdir-spec={CACHE_DIR}/rcm` to avoid
   re-extracting on every launch (already set in `build.sh`).
 - Proxy synchronization still requires the host's `rsync` and, for SSH
-  targets, the host's `ssh` client.
+  targets, the host's `ssh` client. HTTP-over-SSH tunnels additionally require
+  POSIX Unix-domain socket forwarding support in OpenSSH.
 
 ## Notes
 

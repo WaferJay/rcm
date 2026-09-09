@@ -512,9 +512,78 @@ def test_load_remote_config_proxy_target(tmp_path: Path) -> None:
     assert target.remote_config.path == "/etc/rcm/commands.yaml"
     assert target.ssh is not None
     assert target.ssh.command is None
+    assert target.ssh.tunnel is False
     assert target.sync is not None
     assert target.sync.enabled is False
     assert target.artifacts == "passthrough"
+
+
+def test_load_remote_config_ssh_tunnel(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            proxy:
+              compile:
+                ssh:
+                  host: compile-machine
+                  tunnel: true
+                config: /etc/rcm/commands.yaml
+                artifacts: localize
+                sync: {enabled: false}
+            """,
+        )
+    )
+
+    target = cfg.proxy.targets[0]
+    assert target.ssh is not None
+    assert target.ssh.tunnel is True
+    assert target.artifacts == "localize"
+
+
+@pytest.mark.parametrize(
+    "body, fragment",
+    [
+        (
+            """
+            proxy:
+              target:
+                ssh: {host: compile-machine, tunnel: yes-please}
+                config: /etc/rcm/commands.yaml
+            """,
+            "ssh.tunnel must be a boolean",
+        ),
+        (
+            """
+            proxy:
+              target:
+                transport: ssh
+                ssh:
+                  host: compile-machine
+                  command: [rcm, --stdio]
+                  tunnel: true
+            """,
+            "only valid when config is specified",
+        ),
+        (
+            """
+            proxy:
+              target:
+                ssh: {host: compile-machine, tunnel: true}
+                config: /etc/rcm/commands.yaml
+                artifacts: passthrough
+            """,
+            "passthrough is not supported with an SSH tunnel",
+        ),
+    ],
+)
+def test_invalid_ssh_tunnel_configs_rejected(
+    tmp_path: Path,
+    body: str,
+    fragment: str,
+) -> None:
+    with pytest.raises(ConfigError, match=fragment):
+        load_config(write(tmp_path, body))
 
 
 @pytest.mark.parametrize(

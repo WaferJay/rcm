@@ -28,6 +28,8 @@ server:
 #   remote_compile:
 #     ssh:
 #       host: compile-machine
+#       # Optional: reach an HTTP RCM through its remote-side local listener.
+#       tunnel: true
 #     config: /etc/rcm/commands.yaml
 #     sync:
 #       mappings:

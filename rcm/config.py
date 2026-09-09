@@ -168,6 +168,7 @@ class SyncSpec:
 class SSHSpec:
     host: str
     command: list[str] | None = None
+    tunnel: bool = False
 
 
 @dataclass
@@ -649,7 +650,14 @@ def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
             raise ConfigError(
                 f"proxy.{name}.ssh.command must be a non-empty list of strings"
             )
-        ssh = SSHSpec(host=host.strip(), command=ssh_command_raw)
+        ssh_tunnel = ssh_raw.get("tunnel", False)
+        if not isinstance(ssh_tunnel, bool):
+            raise ConfigError(f"proxy.{name}.ssh.tunnel must be a boolean")
+        ssh = SSHSpec(
+            host=host.strip(),
+            command=ssh_command_raw,
+            tunnel=ssh_tunnel,
+        )
 
     endpoint = raw.get("endpoint")
     if endpoint is not None and (
@@ -679,6 +687,14 @@ def _parse_proxy_target(name: str, raw: Any) -> ProxyTargetSpec:
     if transport == "remote" and ssh is not None and ssh.command is not None:
         raise ConfigError(
             f"proxy.{name}.ssh.command must not be specified when config is specified"
+        )
+    if ssh is not None and ssh.tunnel and transport != "remote":
+        raise ConfigError(
+            f"proxy.{name}.ssh.tunnel is only valid when config is specified"
+        )
+    if ssh is not None and ssh.tunnel and artifacts == "passthrough":
+        raise ConfigError(
+            f"proxy.{name}.artifacts passthrough is not supported with an SSH tunnel"
         )
     if transport != "ssh" and transport != "remote" and ssh is not None:
         raise ConfigError(f"proxy.{name}.ssh is only valid for ssh transport")

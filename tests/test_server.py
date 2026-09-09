@@ -25,7 +25,8 @@ from rcm.config import (
     ParamSpec,
     ServerSpec,
 )
-from rcm.server import _build_tool_fn, build_server
+from rcm.proxy import ProxyError
+from rcm.server import _build_tool_fn, _run_proxy_service, build_server
 from rcm.store import Store
 
 
@@ -54,6 +55,49 @@ def test_build_tool_fn_signature_matches_params(tmp_path: Path) -> None:
     assert sig.parameters["b"].annotation is int
     assert sig.parameters["b"].default == 7
     assert sig.parameters["a"].default is inspect.Parameter.empty
+
+
+@pytest.mark.asyncio
+async def test_proxy_service_stops_and_raises_runtime_failure() -> None:
+    stop_requested = asyncio.Event()
+    service_stopped = asyncio.Event()
+
+    class FakeRuntime:
+        async def wait_failure(self) -> ProxyError:
+            await asyncio.sleep(0)
+            return ProxyError("SSH tunnel exited")
+
+    async def service() -> None:
+        await stop_requested.wait()
+        service_stopped.set()
+
+    with pytest.raises(ProxyError, match="SSH tunnel exited"):
+        await _run_proxy_service(
+            service(),
+            FakeRuntime(),
+            request_stop=stop_requested.set,
+        )
+
+    assert service_stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_proxy_service_returns_when_server_stops_normally() -> None:
+    failure_wait_cancelled = asyncio.Event()
+
+    class FakeRuntime:
+        async def wait_failure(self) -> ProxyError:
+            try:
+                await asyncio.Future()
+            finally:
+                failure_wait_cancelled.set()
+
+    async def service() -> None:
+        return None
+
+    await _run_proxy_service(service(), FakeRuntime())
+
+    assert failure_wait_cancelled.is_set()
 
 
 @pytest.fixture
