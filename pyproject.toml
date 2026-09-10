@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-rcm = "rcm.server:main"
+rcm = "rcm.cli:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]

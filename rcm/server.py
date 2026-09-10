@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import sys
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -295,14 +296,14 @@ def _effective_tls_config(config: TLSConfig) -> TLSConfig:
     )
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the rcm MCP server")
     parser.add_argument(
         "--stdio",
         action="store_true",
         help="serve MCP over stdin/stdout instead of Streamable HTTP",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     cfg_path = os.environ.get("RCM_CONFIG", "commands.yaml")
     try:

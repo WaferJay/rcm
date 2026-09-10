@@ -1,7 +1,8 @@
-# rcm — Remote Command MCP Server
+# rcm — Remote Command MCP Server and CLI
 
-A small MCP server that exposes a **fixed allow-list** of shell commands as
-named MCP tools, served over Streamable HTTP or stdio.
+A small MCP server and command-line interface that expose a **fixed allow-list**
+of shell commands as named tools. Tools can be served over Streamable HTTP or
+stdio, or invoked directly from the command line.
 
 - Each command in the YAML config becomes one named MCP tool.
 - Calling a tool runs the command with `shell=False` (no shell expansion),
@@ -55,13 +56,57 @@ uvx --from git+https://github.com/example/rcm rcm
 ```
 
 The `rcm` command is declared in `pyproject.toml` as the entry point for
-`rcm.server:main`.
+`rcm.cli:main`.
 
 Run the test suite with:
 
 ```bash
 uv run pytest
 ```
+
+## Direct command-line invocation
+
+Use `list` and `call` to invoke the tools in a local RCM configuration without
+starting an MCP server. The config path is selected from `--config`, then
+`RCM_CONFIG`, and finally `./commands.yaml`.
+
+```bash
+# Discover local and proxied tools and their JSON schemas.
+rcm list --config commands.yaml
+
+# Pass arguments individually. Values are decoded as JSON when possible;
+# unquoted values such as main remain strings.
+rcm call tail_log --config commands.yaml \
+  --arg lines=100 \
+  --arg file=application.log
+
+# Or provide one JSON object. The two forms can be combined as long as their
+# argument names do not overlap.
+rcm call compile__build --args '{"target":"release","clean":true}'
+```
+
+Direct calls use the same command and proxy implementations as MCP calls. A
+proxied tool therefore runs its configured `sync` mappings before the remote
+call, including the existing exclude, delete, ordering, and protected-path
+rules. A synchronization failure prevents the remote tool from running. Set
+`sync: {enabled: false}` on the target to disable synchronization.
+
+`call` writes one JSON object to stdout with a stable envelope:
+
+```json
+{
+  "content": [],
+  "structured_content": {},
+  "meta": null,
+  "is_error": false
+}
+```
+
+Command artifacts remain on disk under `RCM_RUNS_DIR`; their descriptors use
+local `file://` URIs. The CLI does not automatically print or extract artifact
+contents. For an RCM result, a non-zero command return code in the range 1–255
+is also the CLI exit status. Tool, connection, and synchronization errors exit
+with status 1, while invalid CLI syntax exits with status 2.
 
 ## Configuring commands
 

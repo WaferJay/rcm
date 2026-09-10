@@ -38,7 +38,7 @@ mkdir -p "$OUT_DIR"
 echo ">>> Building rcm in $MODE mode -> $OUT_DIR/"
 
 # Common flags. Use run_rcm.py as the entry point — a thin wrapper around
-# rcm.server.main(). This avoids Nuitka bugs with --python-flag=-m on newer
+# rcm.cli.main(). This avoids Nuitka bugs with --python-flag=-m on newer
 # Python versions.
 COMMON=(
   "--mode=$MODE"
