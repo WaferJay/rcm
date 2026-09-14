@@ -147,9 +147,8 @@ async def running_server(tmp_path: Path, free_port: int):
                 name="session_workspace",
                 description="Run in the MCP session workspace.",
                 command=[sys.executable, "-c", "from pathlib import Path; print(Path.cwd())"],
-                isolate=IsolationSpec(
-                    by="session", base_dir=str(tmp_path / "workspaces")
-                ),
+                cwd=str(tmp_path / "workspaces"),
+                isolate=IsolationSpec(by="session"),
             ),
             CommandSpec(
                 name="ip_workspace",

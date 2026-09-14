@@ -26,7 +26,7 @@ from .runner import run_command
 from .proxy import ProxyError, ProxyRuntime
 from .store import RUN_ID_RE, Store
 from .tls import TLSConfigError, prepare_tls, uvicorn_tls_config
-from .workspace import ScopeResolver
+from .workspace import ScopeResolver, workspace_base_dir
 
 PY_TYPES: dict[str, type] = {
     "string": str,
@@ -63,7 +63,16 @@ def _build_tool_fn(
 
     async def _impl(**kwargs):
         workspace = (
-            scope_resolver.resolve(spec.isolate)
+            scope_resolver.resolve(
+                spec.isolate,
+                base_dir=workspace_base_dir(
+                    spec.isolate,
+                    command_cwd=spec.cwd,
+                    default_cwd=default_cwd,
+                )
+                if spec.isolate is not None and spec.isolate.by != "none"
+                else None,
+            )
             if scope_resolver is not None
             else None
         )
@@ -212,12 +221,20 @@ def _register_download_routes(mcp: FastMCP, store: Store) -> None:
         return PlainTextResponse("ok")
 
 
-def _isolation_meta(spec: CommandSpec) -> dict[str, Any] | None:
+def _isolation_meta(
+    spec: CommandSpec, default_cwd: str | None
+) -> dict[str, Any] | None:
     if spec.isolate is None:
         return None
     data: dict[str, Any] = {"by": spec.isolate.by}
-    if spec.isolate.base_dir is not None:
-        data["base_dir"] = spec.isolate.base_dir
+    if spec.isolate.by != "none":
+        data["base_dir"] = str(
+            workspace_base_dir(
+                spec.isolate,
+                command_cwd=spec.cwd,
+                default_cwd=default_cwd,
+            )
+        )
     return {"rcm": {"isolate": data}}
 
 
@@ -236,7 +253,7 @@ def _register_command_tools(
             cfg.config_path,
             scope_resolver,
         )
-        mcp.tool(fn, meta=_isolation_meta(spec))
+        mcp.tool(fn, meta=_isolation_meta(spec, cfg.defaults.cwd))
 
 
 def build_server(cfg: Config, store: Store, api_key: str | None) -> FastMCP:

@@ -135,7 +135,6 @@ def test_command_isolate_parses_command_workspace_contract(tmp_path: Path) -> No
     "body, fragment",
     [
         ("isolate: {by: invalid, base_dir: /tmp/ws}", "isolate.by"),
-        ("isolate: {by: call}", "base_dir is required"),
         ("isolate: {by: ip, base_dir: workspaces}", "absolute path"),
         (
             "cwd: /tmp\n                    isolate: {by: call, base_dir: /tmp/ws}",
@@ -195,6 +194,26 @@ def test_load_command_collect_paths(tmp_path: Path) -> None:
         ("dist/**/*.tar.gz", True, None, None),
         ("reports/*", False, "success", "always"),
     ]
+
+
+def test_command_isolate_without_base_dir_uses_cwd_resolution(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            defaults: {cwd: /srv/project}
+            commands:
+              - name: build
+                description: Build in the default-root workspace.
+                command: [make]
+                isolate: {by: call}
+            """,
+        )
+    )
+    isolate = cfg.commands[0].isolate
+    assert isolate is not None
+    assert isolate.by == "call"
+    assert isolate.base_dir is None
 
 
 def test_command_collect_defaults_preserve_successful_full_collection(

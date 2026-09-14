@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import secrets
 import re
 from dataclasses import dataclass
@@ -37,16 +38,29 @@ class Workspace:
         return self.cwd
 
 
+def workspace_base_dir(
+    spec: IsolationSpec,
+    *,
+    command_cwd: str | None = None,
+    default_cwd: str | None = None,
+) -> Path:
+    """Resolve an isolation root with the same omission semantics as ``cwd``."""
+    configured = spec.base_dir or command_cwd or default_cwd or os.getcwd()
+    return Path(configured).expanduser().resolve()
+
+
 class ScopeResolver:
     """Resolve command isolation modes from the active FastMCP request."""
 
     def __init__(self, secret: bytes | None = None) -> None:
         self._secret = secret or secrets.token_bytes(32)
 
-    def resolve(self, spec: IsolationSpec | None) -> Workspace | None:
+    def resolve(
+        self, spec: IsolationSpec | None, *, base_dir: Path | None = None
+    ) -> Workspace | None:
         if spec is None or spec.by == "none":
             return None
-        assert spec.base_dir is not None  # guaranteed by config validation
+        root = base_dir or workspace_base_dir(spec)
         forwarded = self._forwarded_scope_id()
         if forwarded is not None:
             scope_id = forwarded
@@ -58,7 +72,7 @@ class ScopeResolver:
             scope_id = self._from_session()
         else:  # defensive: config validation owns the public error message
             raise WorkspaceError(f"unsupported isolation mode {spec.by!r}")
-        return Workspace(scope_id=scope_id, base_dir=Path(spec.base_dir))
+        return Workspace(scope_id=scope_id, base_dir=root)
 
     def _forwarded_scope_id(self) -> str | None:
         """Read an opaque ID forwarded by an RCM proxy, if one is present."""
