@@ -41,11 +41,10 @@ class Workspace:
 def workspace_base_dir(
     spec: IsolationSpec,
     *,
-    command_cwd: str | None = None,
     default_cwd: str | None = None,
 ) -> Path:
     """Resolve an isolation root with the same omission semantics as ``cwd``."""
-    configured = spec.base_dir or command_cwd or default_cwd or os.getcwd()
+    configured = spec.base_dir or default_cwd or os.getcwd()
     return Path(configured).expanduser().resolve()
 
 

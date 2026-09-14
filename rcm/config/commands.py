@@ -174,14 +174,12 @@ def _parse_isolate(raw: Any, command_name: str, cwd: Any) -> IsolationSpec | Non
         if base_dir is not None:
             raise ConfigError(f"{context}.base_dir is not allowed when by is 'none'")
         return IsolationSpec(by="none")
-    if cwd is not None and base_dir is not None:
+    if cwd is not None:
         raise ConfigError(f"command {command_name!r}: cwd cannot be combined with isolate")
     if base_dir is not None:
         if not isinstance(base_dir, str) or not base_dir.strip():
             raise ConfigError(f"{context}.base_dir must be a non-empty string")
         base_dir = base_dir.strip()
-        if not base_dir.startswith("/"):
-            raise ConfigError(f"{context}.base_dir must be an absolute path")
     return IsolationSpec(by=by, base_dir=base_dir)
 
 

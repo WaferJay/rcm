@@ -51,8 +51,9 @@ class CollectSpec:
 class IsolationSpec:
     """Workspace policy for one command.
 
-    ``base_dir`` optionally overrides the cwd-derived container for opaque
-    scope directories when ``by`` selects an isolation mode other than ``none``.
+    ``base_dir`` optionally overrides the default-cwd-derived container for
+    opaque scope directories when ``by`` selects an isolation mode other than
+    ``none``.
     """
 
     by: str

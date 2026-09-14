@@ -105,7 +105,7 @@ commands:
   #         on_exit: always
   #         mode: always
   #         required: false
-  #   # Optional per-command isolated workspace. Omit base_dir to use cwd.
+  #   # Optional per-command isolated workspace. Omit base_dir to use defaults.cwd.
   #   # isolate:
   #   #   by: session  # none, ip, session, or call
   #   #   base_dir: /srv/rcm/workspaces

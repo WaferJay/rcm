@@ -166,9 +166,9 @@ Rules:
 Commands normally use their configured `cwd` and share its filesystem state.
 Use `isolate` when a command must run in a separate workspace selected by the
 HTTP caller. `base_dir` is optional: rcm uses it when provided, otherwise it
-uses the command `cwd`, then `defaults.cwd`, then its current directory. rcm
-creates an opaque child directory below that root and uses it as the command's
-effective cwd.
+uses `defaults.cwd`, then its current directory. rcm creates an opaque child
+directory below that root and uses it as the command's effective cwd.
+Like `cwd`, a relative `base_dir` is resolved from rcm's current directory.
 
 ```yaml
 commands:
@@ -180,13 +180,12 @@ commands:
       base_dir: /srv/rcm/workspaces
 ```
 
-When `base_dir` is set it cannot be combined with command `cwd`; omitting it
-deliberately reuses the normal cwd resolution. `ip` uses the HTTP TCP peer
-address (forwarding headers are not trusted), `session` uses the MCP HTTP
-session, and `call` creates a workspace for every invocation. StdIO and direct
-CLI calls cannot use `ip` or `session`. Isolated artifacts are stored and
-returned under `/runs/<opaque-scope-id>/<run-id>/...`; these remain capability
-URLs, not authenticated download URLs.
+Enabled `isolate` cannot be combined with command `cwd`. `ip` uses the HTTP
+TCP peer address (forwarding headers are not trusted), `session` uses the MCP
+HTTP session, and `call` creates a workspace for every invocation. StdIO and
+direct CLI calls cannot use `ip` or `session`. Isolated artifacts are stored
+and returned under `/runs/<opaque-scope-id>/<run-id>/...`; these remain
+capability URLs, not authenticated download URLs.
 
 ### Collecting command files
 

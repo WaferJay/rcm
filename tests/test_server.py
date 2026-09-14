@@ -115,10 +115,12 @@ def free_port() -> int:
 @pytest.fixture
 async def running_server(tmp_path: Path, free_port: int):
     """Start a real FastMCP HTTP server in a background task on a free port."""
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
     cfg = Config(
         server=ServerSpec(host="127.0.0.1", port=free_port, public_base_url=f"http://127.0.0.1:{free_port}"),
         auth=AuthSpec(api_key=None),
-        defaults=DefaultsSpec(timeout=5, cwd=None),
+        defaults=DefaultsSpec(timeout=5, cwd=str(workspace_root)),
         commands=[
             CommandSpec(
                 name="echo_hi",
@@ -147,7 +149,6 @@ async def running_server(tmp_path: Path, free_port: int):
                 name="session_workspace",
                 description="Run in the MCP session workspace.",
                 command=[sys.executable, "-c", "from pathlib import Path; print(Path.cwd())"],
-                cwd=str(tmp_path / "workspaces"),
                 isolate=IsolationSpec(by="session"),
             ),
             CommandSpec(

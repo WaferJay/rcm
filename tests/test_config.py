@@ -135,9 +135,8 @@ def test_command_isolate_parses_command_workspace_contract(tmp_path: Path) -> No
     "body, fragment",
     [
         ("isolate: {by: invalid, base_dir: /tmp/ws}", "isolate.by"),
-        ("isolate: {by: ip, base_dir: workspaces}", "absolute path"),
         (
-            "cwd: /tmp\n                    isolate: {by: call, base_dir: /tmp/ws}",
+            "cwd: /tmp\n                    isolate: {by: call}",
             "cannot be combined",
         ),
         ("isolate: {by: none, base_dir: /tmp/ws}", "not allowed"),
@@ -196,7 +195,7 @@ def test_load_command_collect_paths(tmp_path: Path) -> None:
     ]
 
 
-def test_command_isolate_without_base_dir_uses_cwd_resolution(tmp_path: Path) -> None:
+def test_command_isolate_without_base_dir_uses_default_cwd(tmp_path: Path) -> None:
     cfg = load_config(
         write(
             tmp_path,
@@ -214,6 +213,23 @@ def test_command_isolate_without_base_dir_uses_cwd_resolution(tmp_path: Path) ->
     assert isolate is not None
     assert isolate.by == "call"
     assert isolate.base_dir is None
+
+
+def test_command_isolate_accepts_relative_base_dir(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            commands:
+              - name: build
+                description: Build in a relative workspace.
+                command: [make]
+                isolate: {by: call, base_dir: workspaces}
+            """,
+        )
+    )
+    assert cfg.commands[0].isolate is not None
+    assert cfg.commands[0].isolate.base_dir == "workspaces"
 
 
 def test_command_collect_defaults_preserve_successful_full_collection(

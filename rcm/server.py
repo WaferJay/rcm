@@ -67,7 +67,6 @@ def _build_tool_fn(
                 spec.isolate,
                 base_dir=workspace_base_dir(
                     spec.isolate,
-                    command_cwd=spec.cwd,
                     default_cwd=default_cwd,
                 )
                 if spec.isolate is not None and spec.isolate.by != "none"
@@ -231,7 +230,6 @@ def _isolation_meta(
         data["base_dir"] = str(
             workspace_base_dir(
                 spec.isolate,
-                command_cwd=spec.cwd,
                 default_cwd=default_cwd,
             )
         )
