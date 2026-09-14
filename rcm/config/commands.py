@@ -15,6 +15,8 @@ from .models import (
     CollectSpec,
     CommandSpec,
     ConfigError,
+    ISOLATION_MODES,
+    IsolationSpec,
     ParamSpec,
 )
 
@@ -152,6 +154,36 @@ def _parse_collect(raw: Any, command_name: str) -> CollectSpec | None:
     return CollectSpec(paths=tuple(paths), on_exit=on_exit, mode=mode)
 
 
+def _parse_isolate(raw: Any, command_name: str, cwd: Any) -> IsolationSpec | None:
+    """Parse the command-local workspace policy without overloading ``cwd``."""
+    if raw is None:
+        return None
+    context = f"command {command_name!r}: isolate"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{context} must be a mapping")
+    unknown = set(raw) - {"by", "base_dir"}
+    if unknown:
+        raise ConfigError(f"{context} has unknown fields: {sorted(unknown)}")
+    by = raw.get("by", "none")
+    if not isinstance(by, str) or by not in ISOLATION_MODES:
+        raise ConfigError(
+            f"{context}.by must be one of {sorted(ISOLATION_MODES)}, got {by!r}"
+        )
+    base_dir = raw.get("base_dir")
+    if by == "none":
+        if base_dir is not None:
+            raise ConfigError(f"{context}.base_dir is not allowed when by is 'none'")
+        return IsolationSpec(by="none")
+    if cwd is not None:
+        raise ConfigError(f"command {command_name!r}: cwd cannot be combined with isolate")
+    if not isinstance(base_dir, str) or not base_dir.strip():
+        raise ConfigError(f"{context}.base_dir is required when isolation is enabled")
+    base_dir = base_dir.strip()
+    if not base_dir.startswith("/"):
+        raise ConfigError(f"{context}.base_dir must be an absolute path")
+    return IsolationSpec(by=by, base_dir=base_dir)
+
+
 def _parse_command(raw: dict[str, Any]) -> CommandSpec:
     if not isinstance(raw, dict):
         raise ConfigError("each entry in `commands` must be a mapping")
@@ -206,6 +238,7 @@ def _parse_command(raw: dict[str, Any]) -> CommandSpec:
     cwd = raw.get("cwd")
     if cwd is not None and not isinstance(cwd, str):
         raise ConfigError(f"command {name!r}: cwd must be a string")
+    isolate = _parse_isolate(raw.get("isolate"), name, cwd)
 
     return CommandSpec(
         name=name,
@@ -215,4 +248,5 @@ def _parse_command(raw: dict[str, Any]) -> CommandSpec:
         timeout=float(timeout) if timeout is not None else None,
         cwd=cwd,
         collect=_parse_collect(raw.get("collect"), name),
+        isolate=isolate,
     )

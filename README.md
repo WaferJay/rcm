@@ -161,6 +161,30 @@ Rules:
 - Optional per-param: `description`, `default`, `pattern` (regex), `enum`.
 - `name` must match `^[a-zA-Z_][a-zA-Z0-9_]*$` and be globally unique.
 
+### Isolated command workspaces
+
+Commands normally use their configured `cwd` and share its filesystem state.
+Use `isolate` when a command must run in a separate workspace selected by the
+HTTP caller. `base_dir` is a container directory; rcm creates an opaque child
+directory below it and uses that child as the command's effective cwd.
+
+```yaml
+commands:
+  - name: build
+    description: Build in a session-specific workspace.
+    command: [make, build]
+    isolate:
+      by: session  # none (default), ip, session, or call
+      base_dir: /srv/rcm/workspaces
+```
+
+`cwd` and enabled `isolate` are mutually exclusive. `ip` uses the HTTP TCP
+peer address (forwarding headers are not trusted), `session` uses the MCP HTTP
+session, and `call` creates a workspace for every invocation. StdIO and direct
+CLI calls cannot use `ip` or `session`. Isolated artifacts are stored and
+returned under `/runs/<opaque-scope-id>/<run-id>/...`; these remain capability
+URLs, not authenticated download URLs.
+
 ### Collecting command files
 
 `commands[*].collect.paths` is an allow-list of files and directories to pack.
@@ -306,6 +330,11 @@ pairs. They run in order under one target-level lock, and each mapping has its
 own `excludes` and `delete` options. A failed mapping stops the remaining
 mappings and blocks the remote call. The legacy single-mapping fields directly
 under `sync` remain supported, but cannot be mixed with `mappings`.
+
+When the discovered remote command configures `isolate`, every sync
+`destination` must instead be a relative POSIX path (use `.` for the workspace
+root). rcm resolves it below that command's isolated `base_dir` and forwards
+the same opaque scope ID to the remote RCM before invoking the tool.
 
 For `ssh` plus `config`, a relative destination is resolved below the remote
 `defaults.cwd`, falling back to the directory containing the remote config.

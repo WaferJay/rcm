@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from rcm.store import RUN_ID_RE, Store, StoreError
+from rcm.store import RUN_ID_RE, SCOPE_ID_RE, Store, StoreError
 
 
 def test_new_run_id_is_url_safe_and_unique() -> None:
@@ -47,6 +47,22 @@ def test_create_run_makes_directory(tmp_path: Path) -> None:
     assert RUN_ID_RE.fullmatch(rid)
     assert d.is_dir()
     assert d.parent == tmp_path
+
+
+def test_scoped_run_uses_scoped_directory_and_url(tmp_path: Path) -> None:
+    s = Store(tmp_path, public_base_url="https://x")
+    scope = "scope-client_a"
+    rid, directory = s.create_run(scope)
+    assert SCOPE_ID_RE.fullmatch(scope)
+    assert directory == tmp_path / scope / rid
+    assert s.url_for(rid, "stdout", scope) == f"https://x/runs/{scope}/{rid}/stdout"
+    assert s.file_path(rid, "stderr", scope).parent == directory
+
+
+def test_scoped_run_rejects_invalid_scope(tmp_path: Path) -> None:
+    s = Store(tmp_path, public_base_url="https://x")
+    with pytest.raises(StoreError, match="scope"):
+        s.create_run("not-a-scope")
 
 
 def test_file_path_rejects_path_traversal(tmp_path: Path) -> None:

@@ -15,6 +15,7 @@ from rcm.config import (
     SyncSpec,
 )
 from rcm.sync import SyncError, SyncRunner
+from rcm.workspace import Workspace
 
 
 def _sync(*mappings: SyncMappingSpec) -> SyncSpec:
@@ -113,6 +114,31 @@ def test_ssh_sync_destination_uses_target_host(tmp_path: Path) -> None:
     runner = SyncRunner(target)
     command = runner._command(mapping, tmp_path)
     assert command[-1] == "compile-machine:remote/project/"
+
+
+def test_scoped_sync_destination_is_relative_to_workspace_base(tmp_path: Path) -> None:
+    mapping = SyncMappingSpec(source=str(tmp_path), destination="src")
+    target = ProxyTargetSpec(
+        name="compile",
+        transport="ssh",
+        ssh=SSHSpec(host="compile-machine", command=["rcm", "--stdio"]),
+        sync=_sync(mapping),
+    )
+    workspace = Workspace("scope-client", Path("/srv/rcm/workspaces"))
+    command = SyncRunner(target)._command(mapping, tmp_path, workspace)
+    assert command[-1] == "compile-machine:/srv/rcm/workspaces/scope-client/src/"
+
+
+@pytest.mark.parametrize("destination", ["/srv/project", "../escape", "host:/srv/project"])
+def test_scoped_sync_rejects_non_workspace_destination(tmp_path: Path, destination: str) -> None:
+    mapping = SyncMappingSpec(source=str(tmp_path), destination=destination)
+    target = ProxyTargetSpec(
+        name="compile", transport="stdio", command=["echo"], sync=_sync(mapping)
+    )
+    with pytest.raises(SyncError, match="isolated sync.destination"):
+        SyncRunner(target)._command(
+            mapping, tmp_path, Workspace("scope-client", Path("/srv/rcm/workspaces"))
+        )
 
 
 def test_http_remote_config_sync_destination_uses_ssh_host(tmp_path: Path) -> None:

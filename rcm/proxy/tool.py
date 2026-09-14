@@ -25,8 +25,10 @@ from ..artifacts import (
     parse_run_result,
     public_run_result,
 )
+from ..config import IsolationSpec
 from ..store import Store, StoreError
 from ..sync import SyncError, SyncRunner
+from ..workspace import ScopeResolver, Workspace
 from .artifact_transfer import ArtifactFetcher, _standard_artifact_fetcher
 
 
@@ -44,6 +46,9 @@ class ProxyTool(Tool):
     _rcm_peer: bool = PrivateAttr()
     _artifact_fetcher: ArtifactFetcher = PrivateAttr()
     _failure_reporter: Callable[[Exception], None] | None = PrivateAttr()
+    _isolate: IsolationSpec | None = PrivateAttr()
+    _scope_resolver: ScopeResolver | None = PrivateAttr()
+    _workspace_peer: bool = PrivateAttr()
 
     def __init__(
         self,
@@ -63,12 +68,16 @@ class ProxyTool(Tool):
         rcm_peer: bool = False,
         artifact_fetcher: ArtifactFetcher | None = None,
         failure_reporter: Callable[[Exception], None] | None = None,
+        isolate: IsolationSpec | None = None,
+        scope_resolver: ScopeResolver | None = None,
+        workspace_peer: bool = False,
     ) -> None:
         super().__init__(
             name=public_name,
             description=description or f"Proxy for {target_name}::{remote_name}",
             parameters=parameters,
             output_schema=output_schema,
+            meta=self._isolation_meta(isolate),
         )
         self._target_name = target_name
         self._remote_name = remote_name
@@ -84,18 +93,34 @@ class ProxyTool(Tool):
             ssh_host,
         )
         self._failure_reporter = failure_reporter
+        self._isolate = isolate
+        self._scope_resolver = scope_resolver
+        self._workspace_peer = workspace_peer
+
+    @staticmethod
+    def _isolation_meta(isolate: IsolationSpec | None) -> dict[str, Any] | None:
+        if isolate is None:
+            return None
+        value: dict[str, Any] = {"by": isolate.by}
+        if isolate.base_dir is not None:
+            value["base_dir"] = isolate.base_dir
+        return {"rcm": {"isolate": value}}
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        workspace = self._resolve_workspace()
         if self._sync_runner is not None:
             try:
-                await self._sync_runner.sync()
+                if workspace is None:
+                    await self._sync_runner.sync()
+                else:
+                    await self._sync_runner.sync(workspace)
             except SyncError as exc:
                 raise ToolError(str(exc)) from exc
 
         try:
             call_kwargs: dict[str, Any] = {}
             if self._rcm_peer:
-                call_kwargs["meta"] = RCM_CALL_META
+                call_kwargs["meta"] = self._call_meta(workspace)
             result = await self._client.call_tool_mcp(
                 self._remote_name, arguments or {}, **call_kwargs
             )
@@ -121,7 +146,7 @@ class ProxyTool(Tool):
                 if self._artifact_mode == "passthrough":
                     self._validate_passthrough(remote)
                 else:
-                    structured_content = await self._materialize_artifact(remote)
+                    structured_content = await self._materialize_artifact(remote, workspace)
                 rewritten = True
             except (ArtifactError, OSError, StoreError) as exc:
                 raise ToolError(str(exc)) from exc
@@ -141,6 +166,28 @@ class ProxyTool(Tool):
             meta=getattr(result, "meta", None),
             is_error=getattr(result, "is_error", getattr(result, "isError", False)),
         )
+
+    def _resolve_workspace(self) -> Workspace | None:
+        if self._isolate is None or self._isolate.by == "none":
+            return None
+        if not self._workspace_peer:
+            raise ArtifactError(
+                "isolated proxy tool requires a downstream RCM workspace capability"
+            )
+        if self._scope_resolver is None:
+            raise ArtifactError("isolated proxy tool has no scope resolver")
+        return self._scope_resolver.resolve(self._isolate)
+
+    @staticmethod
+    def _call_meta(workspace: Workspace | None) -> dict[str, Any]:
+        if workspace is None:
+            return RCM_CALL_META
+        return {
+            "rcm": {
+                "artifacts": {"version": 2},
+                "workspace": {"scope_id": workspace.scope_id},
+            }
+        }
 
     def _validate_passthrough(self, remote: RunResult) -> None:
         if self._target_transport != "http":
@@ -173,10 +220,13 @@ class ProxyTool(Tool):
             destination,
         )
 
-    async def _materialize_artifact(self, remote: RunResult) -> dict[str, Any]:
+    async def _materialize_artifact(
+        self, remote: RunResult, workspace: Workspace | None = None
+    ) -> dict[str, Any]:
         if self._store is None:
             raise ArtifactError("rcm artifact received without a local store")
-        run_id, staging = self._store.create_staging_run()
+        scope_id = workspace.scope_id if workspace is not None else None
+        run_id, staging = self._store.create_staging_run(scope_id)
         try:
             for name, descriptor in remote.artifacts.items():
                 await self._copy_artifact(
@@ -187,7 +237,7 @@ class ProxyTool(Tool):
                 )
             artifacts = {
                 name: ArtifactDescriptor(
-                    uri=self._store.url_for(run_id, name),
+                    uri=self._store.url_for(run_id, name, scope_id),
                     bytes=descriptor.bytes,
                     sha256=descriptor.sha256,
                 )
@@ -210,7 +260,7 @@ class ProxyTool(Tool):
                     "transport": self._target_transport,
                 },
             }
-            self._store.commit_staging_run(run_id, staging, meta)
+            self._store.commit_staging_run(run_id, staging, meta, scope_id)
             return local
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)

@@ -13,6 +13,7 @@ import pytest
 from rcm.config import CollectPathSpec, CollectSpec, CommandSpec, ParamSpec
 from rcm.runner import RunError, _resolve_params, _substitute, run_command
 from rcm.store import Store
+from rcm.workspace import Workspace
 
 
 def make_spec(
@@ -149,6 +150,29 @@ async def test_run_command_success_writes_files(tmp_path: Path) -> None:
     meta = json.loads((store.run_dir(rid) / "meta.json").read_text())
     assert meta["command_name"] == "echo_it"
     assert meta["returncode"] == 0
+
+
+async def test_run_command_uses_workspace_for_cwd_and_artifacts(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    workspace = Workspace("scope-test", tmp_path / "workspaces")
+    spec = make_spec(
+        "pwd",
+        [sys.executable, "-c", "from pathlib import Path; print(Path.cwd())"],
+    )
+    result = await run_command(
+        spec,
+        {},
+        store=store,
+        default_timeout=10,
+        default_cwd=None,
+        workspace=workspace,
+    )
+    expected = workspace.cwd.resolve()
+    assert expected.is_dir()
+    assert result["stdout"]["uri"].startswith(
+        f"https://example.test/runs/{workspace.scope_id}/"
+    )
+    assert store.file_path(result["run_id"], "stdout", workspace.scope_id).read_text().strip() == str(expected)
 
 
 async def test_run_command_returns_binary_safe_v2_artifacts(tmp_path: Path) -> None:

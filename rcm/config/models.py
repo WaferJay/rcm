@@ -14,6 +14,7 @@ PROXY_TRANSPORTS = {"stdio", "ssh", "http", "sse"}
 SERVER_TRANSPORTS = {"http", "stdio"}
 COLLECT_ON_EXIT = {"success", "always"}
 COLLECT_MODES = {"always", "changed"}
+ISOLATION_MODES = {"none", "ip", "session", "call"}
 
 
 class ConfigError(ValueError):
@@ -46,6 +47,18 @@ class CollectSpec:
     mode: str = "always"
 
 
+@dataclass(frozen=True)
+class IsolationSpec:
+    """Workspace policy for one command.
+
+    ``base_dir`` is the container for opaque scope directories and is only
+    meaningful when ``by`` selects an isolation mode other than ``none``.
+    """
+
+    by: str
+    base_dir: str | None = None
+
+
 @dataclass
 class CommandSpec:
     name: str
@@ -55,6 +68,7 @@ class CommandSpec:
     timeout: float | None = None
     cwd: str | None = None
     collect: CollectSpec | None = None
+    isolate: IsolationSpec | None = None
 
 
 @dataclass

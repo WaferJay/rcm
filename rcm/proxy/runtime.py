@@ -15,10 +15,13 @@ from ..artifacts import (
     RCM_CAPABILITY,
     RCM_EXPERIMENTAL_CAPABILITIES,
     RCM_PROTOCOL_VERSION,
+    RCM_WORKSPACE_CAPABILITY,
+    RCM_WORKSPACE_PROTOCOL_VERSION,
 )
 from ..auth import ApiKeyAuth
-from ..config import Config
+from ..config import Config, ISOLATION_MODES, IsolationSpec
 from ..store import Store
+from ..workspace import ScopeResolver
 from ..sync import SyncError, SyncRunner
 from .connectors import ConnectorContext, _prepare_target
 from .errors import ProxyError
@@ -38,6 +41,40 @@ def _supports_rcm_v2(client: Client) -> bool:
     return isinstance(versions, list) and RCM_PROTOCOL_VERSION in versions
 
 
+def _supports_workspace_scopes(client: Client) -> bool:
+    initialized = client.initialize_result
+    if initialized is None:
+        return False
+    experimental = initialized.capabilities.experimental or {}
+    capability = experimental.get(RCM_WORKSPACE_CAPABILITY)
+    if not isinstance(capability, dict):
+        return False
+    versions = capability.get("versions")
+    return isinstance(versions, list) and RCM_WORKSPACE_PROTOCOL_VERSION in versions
+
+
+def _remote_isolation(tool: Any) -> IsolationSpec | None:
+    """Read the optional RCM command contract from MCP tool metadata."""
+    meta = getattr(tool, "meta", None)
+    if not isinstance(meta, dict):
+        meta = getattr(tool, "_meta", None)
+    if not isinstance(meta, dict):
+        return None
+    rcm = meta.get("rcm")
+    raw = rcm.get("isolate") if isinstance(rcm, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    by = raw.get("by")
+    base_dir = raw.get("base_dir")
+    if not isinstance(by, str) or by not in ISOLATION_MODES:
+        return None
+    if by == "none":
+        return IsolationSpec(by="none")
+    if not isinstance(base_dir, str) or not base_dir.startswith("/"):
+        return None
+    return IsolationSpec(by=by, base_dir=base_dir)
+
+
 class ProxyRuntime:
     """Own connected remote clients and the locally registered proxy tools."""
 
@@ -47,11 +84,13 @@ class ProxyRuntime:
         stack: AsyncExitStack,
         failure: asyncio.Future[ProxyError],
         monitor_tasks: list[asyncio.Task[None]],
+        scope_resolver: ScopeResolver,
     ) -> None:
         self.server = server
         self._stack = stack
         self._failure = failure
         self._monitor_tasks = monitor_tasks
+        self.scope_resolver = scope_resolver
 
     @classmethod
     async def create(
@@ -75,6 +114,7 @@ class ProxyRuntime:
             asyncio.get_running_loop().create_future()
         )
         monitor_tasks: list[asyncio.Task[None]] = []
+        scope_resolver = ScopeResolver()
 
         def report_failure(target_name: str, exc: Exception) -> None:
             if failure.done():
@@ -140,6 +180,7 @@ class ProxyRuntime:
                         f"proxy target {target.name!r} failed to connect: {exc}"
                     ) from exc
                 rcm_peer = _supports_rcm_v2(client)
+                workspace_peer = _supports_workspace_scopes(client)
                 if configured_target.remote_config is not None and not rcm_peer:
                     raise ProxyError(
                         f"remote-config target {target.name!r} does not support "
@@ -172,6 +213,7 @@ class ProxyRuntime:
                     output_schema = getattr(remote_tool, "outputSchema", None)
                     if not isinstance(output_schema, dict):
                         output_schema = None
+                    isolate = _remote_isolation(remote_tool)
                     server.add_tool(
                         ProxyTool(
                             public_name=public_name,
@@ -191,6 +233,9 @@ class ProxyRuntime:
                             rcm_peer=rcm_peer,
                             artifact_fetcher=prepared.artifact_fetcher,
                             failure_reporter=failure_reporter,
+                            scope_resolver=scope_resolver,
+                            isolate=isolate,
+                            workspace_peer=workspace_peer,
                         )
                     )
                 if prepared.monitor is not None:
@@ -208,7 +253,7 @@ class ProxyRuntime:
             await _cancel_tasks(monitor_tasks)
             await stack.aclose()
             raise
-        return cls(server, stack, failure, monitor_tasks)
+        return cls(server, stack, failure, monitor_tasks, scope_resolver)
 
     async def wait_failure(self) -> ProxyError:
         """Wait until a monitored target requires the proxy to terminate."""

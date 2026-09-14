@@ -9,6 +9,7 @@ import shutil
 from pathlib import Path, PurePosixPath
 
 from .config import ProxyTargetSpec, SyncMappingSpec, SyncSpec
+from .workspace import Workspace
 
 
 class SyncError(RuntimeError):
@@ -80,18 +81,41 @@ class SyncRunner:
             )
         return source
 
-    def _destination(self, mapping: SyncMappingSpec) -> str:
+    def _destination(
+        self, mapping: SyncMappingSpec, workspace: Workspace | None = None
+    ) -> str:
         if mapping.destination is None:
             raise SyncError(
                 f"sync destination is not configured for target {self.target.name!r}"
             )
         destination = mapping.destination.rstrip("/") or "/"
+        if workspace is not None:
+            destination = self._workspace_destination(destination, workspace)
         if self.target.ssh is not None:
             # Permit an explicit rsync host in the destination, otherwise use
             # the SSH target's configured host and keep the YAML concise.
             if ":" not in destination.split("/", 1)[0]:
                 return f"{self.target.ssh.host}:{destination}"
         return destination
+
+    @staticmethod
+    def _workspace_destination(destination: str, workspace: Workspace) -> str:
+        """Resolve one mapping below an isolated command's base directory."""
+        first = destination.split("/", 1)[0]
+        if destination.startswith("/") or ":" in first or "\\" in destination:
+            raise SyncError(
+                "isolated sync.destination must be a relative POSIX path"
+            )
+        normalized = posixpath.normpath(destination)
+        if normalized == ".":
+            suffix = ""
+        elif normalized == ".." or normalized.startswith("../"):
+            raise SyncError(
+                "isolated sync.destination must not escape the workspace"
+            )
+        else:
+            suffix = f"/{normalized}"
+        return f"{workspace.base_dir.as_posix().rstrip('/')}/{workspace.scope_id}{suffix}"
 
     @staticmethod
     def _local_exclude(
@@ -149,7 +173,12 @@ class SyncRunner:
                 patterns.append(pattern)
         return patterns
 
-    def _command(self, mapping: SyncMappingSpec, source: Path) -> list[str]:
+    def _command(
+        self,
+        mapping: SyncMappingSpec,
+        source: Path,
+        workspace: Workspace | None = None,
+    ) -> list[str]:
         command = ["rsync", "-a", "--compress"]
         for pattern in self._protected_patterns(mapping, source):
             command.extend(("--exclude", pattern))
@@ -159,7 +188,7 @@ class SyncRunner:
             (
                 "--",
                 _trailing_slash(str(source)),
-                _trailing_slash(self._destination(mapping)),
+                _trailing_slash(self._destination(mapping, workspace)),
             )
         )
         return command
@@ -209,7 +238,7 @@ class SyncRunner:
                         "while delete is enabled"
                     )
 
-    async def sync(self) -> None:
+    async def sync(self, workspace: Workspace | None = None) -> None:
         """Synchronize all mappings in order, serializing calls for this target."""
         async with self._lock:
             if shutil.which("rsync") is None:
@@ -219,8 +248,8 @@ class SyncRunner:
                 for index, mapping in enumerate(self.spec.mappings, start=1)
             ]
             for index, mapping, source in resolved:
-                destination = self._destination(mapping)
-                command = self._command(mapping, source)
+                destination = self._destination(mapping, workspace)
+                command = self._command(mapping, source, workspace)
                 try:
                     proc = await asyncio.create_subprocess_exec(
                         *command,

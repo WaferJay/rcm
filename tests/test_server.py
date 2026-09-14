@@ -22,6 +22,7 @@ from rcm.config import (
     CommandSpec,
     Config,
     DefaultsSpec,
+    IsolationSpec,
     ParamSpec,
     ServerSpec,
 )
@@ -142,6 +143,22 @@ async def running_server(tmp_path: Path, free_port: int):
                 cwd=str(tmp_path),
                 collect=CollectSpec(paths=(CollectPathSpec("artifact.bin"),)),
             ),
+            CommandSpec(
+                name="session_workspace",
+                description="Run in the MCP session workspace.",
+                command=[sys.executable, "-c", "from pathlib import Path; print(Path.cwd())"],
+                isolate=IsolationSpec(
+                    by="session", base_dir=str(tmp_path / "workspaces")
+                ),
+            ),
+            CommandSpec(
+                name="ip_workspace",
+                description="Run in the client-IP workspace.",
+                command=[sys.executable, "-c", "from pathlib import Path; print(Path.cwd())"],
+                isolate=IsolationSpec(
+                    by="ip", base_dir=str(tmp_path / "workspaces")
+                ),
+            ),
         ],
     )
     store = Store(tmp_path / "runs", public_base_url=f"http://127.0.0.1:{free_port}")
@@ -183,7 +200,13 @@ async def test_list_tools_with_valid_key(running_server) -> None:
     async with client:
         tools = await client.list_tools()
     names = {t.name for t in tools}
-    assert names == {"echo_hi", "echo_arg", "make_artifact"}
+    assert names == {
+        "echo_hi",
+        "echo_arg",
+        "make_artifact",
+        "session_workspace",
+        "ip_workspace",
+    }
     arg_tool = next(t for t in tools if t.name == "echo_arg")
     assert "w" in (arg_tool.inputSchema or {}).get("properties", {})
 
@@ -201,6 +224,8 @@ async def test_server_advertises_rcm_v2_without_internal_tools(running_server) -
         "echo_hi",
         "echo_arg",
         "make_artifact",
+        "session_workspace",
+        "ip_workspace",
     }
 
 
@@ -238,6 +263,31 @@ async def test_call_tool_param_validation(running_server) -> None:
         # pattern violation -> ToolError
         with pytest.raises(Exception, match="pattern"):
             await client.call_tool("echo_arg", {"w": "Bad-Value"})
+
+
+async def test_session_isolate_scopes_cwd_and_artifact_route(running_server) -> None:
+    client = make_client(running_server["url"], "testkey")
+    async with client:
+        result = await client.call_tool("session_workspace", {})
+    data = result.data
+    uri = data["stdout"]["uri"]
+    parts = urlparse(uri).path.split("/")
+    assert parts[-3].startswith("scope-")
+    assert "/runs/scope-" in uri
+    assert running_server["store"].file_path(
+        data["run_id"], "stdout", parts[-3]
+    ).read_text().strip().endswith(parts[-3])
+
+
+async def test_ip_isolate_uses_an_opaque_scope(running_server) -> None:
+    client = make_client(running_server["url"], "testkey")
+    async with client:
+        first = await client.call_tool("ip_workspace", {})
+        second = await client.call_tool("ip_workspace", {})
+    first_scope = urlparse(first.data["stdout"]["uri"]).path.split("/")[-3]
+    second_scope = urlparse(second.data["stdout"]["uri"]).path.split("/")[-3]
+    assert first_scope.startswith("scope-")
+    assert first_scope == second_scope
 
 
 async def test_stdio_server_returns_local_file_urls(tmp_path: Path) -> None:

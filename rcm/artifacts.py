@@ -11,7 +11,9 @@ from typing import Any, Mapping
 
 RCM_RESULT_SCHEMA = "rcm.run-result/v2"
 RCM_CAPABILITY = "rcm.artifacts"
+RCM_WORKSPACE_CAPABILITY = "rcm.workspace"
 RCM_PROTOCOL_VERSION = 2
+RCM_WORKSPACE_PROTOCOL_VERSION = 1
 RCM_CALL_META: dict[str, Any] = {
     "rcm": {"artifacts": {"version": RCM_PROTOCOL_VERSION}}
 }
@@ -70,7 +72,8 @@ RCM_EXPERIMENTAL_CAPABILITIES: dict[str, dict[str, Any]] = {
         "versions": [RCM_PROTOCOL_VERSION],
         "uriSchemes": ["file", "http", "https"],
         "artifactKinds": list(ARTIFACT_KINDS),
-    }
+    },
+    RCM_WORKSPACE_CAPABILITY: {"versions": [RCM_WORKSPACE_PROTOCOL_VERSION]},
 }
 
 

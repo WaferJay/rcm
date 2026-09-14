@@ -112,6 +112,56 @@ def test_full_command_with_params_and_defaults(tmp_path: Path) -> None:
     assert file_p.has_default is False
 
 
+def test_command_isolate_parses_command_workspace_contract(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            commands:
+              - name: build
+                description: Build in a scoped workspace.
+                command: [make]
+                isolate: {by: session, base_dir: /srv/rcm/workspaces}
+            """,
+        )
+    )
+    isolate = cfg.commands[0].isolate
+    assert isolate is not None
+    assert isolate.by == "session"
+    assert isolate.base_dir == "/srv/rcm/workspaces"
+
+
+@pytest.mark.parametrize(
+    "body, fragment",
+    [
+        ("isolate: {by: invalid, base_dir: /tmp/ws}", "isolate.by"),
+        ("isolate: {by: call}", "base_dir is required"),
+        ("isolate: {by: ip, base_dir: workspaces}", "absolute path"),
+        (
+            "cwd: /tmp\n                    isolate: {by: call, base_dir: /tmp/ws}",
+            "cannot be combined",
+        ),
+        ("isolate: {by: none, base_dir: /tmp/ws}", "not allowed"),
+    ],
+)
+def test_invalid_command_isolate_rejected(
+    tmp_path: Path, body: str, fragment: str
+) -> None:
+    with pytest.raises(ConfigError, match=fragment):
+        load_config(
+            write(
+                tmp_path,
+                f"""
+                commands:
+                  - name: build
+                    description: Build.
+                    command: [make]
+                    {body}
+                """,
+            )
+        )
+
+
 def test_load_command_collect_paths(tmp_path: Path) -> None:
     cfg = load_config(
         write(

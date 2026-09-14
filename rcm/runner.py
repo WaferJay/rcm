@@ -20,6 +20,7 @@ from .artifacts import (
 from .collection import ArtifactCollector, DEFAULT_COLLECTOR
 from .config import CommandSpec, ParamSpec
 from .store import Store
+from .workspace import Workspace
 
 
 class RunError(Exception):
@@ -110,6 +111,7 @@ async def run_command(
     default_cwd: str | None,
     config_path: Path | None = None,
     collector: ArtifactCollector = DEFAULT_COLLECTOR,
+    workspace: Workspace | None = None,
 ) -> dict[str, Any]:
     """Execute one configured command, capturing output to disk."""
     resolved = _resolve_params(spec, supplied_params)
@@ -118,11 +120,15 @@ async def run_command(
     timeout = spec.timeout if spec.timeout is not None else default_timeout
     cwd = spec.cwd if spec.cwd is not None else default_cwd
 
-    run_id, _ = store.create_run()
-    stdout_path = store.file_path(run_id, "stdout")
-    stderr_path = store.file_path(run_id, "stderr")
-
-    effective_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
+    scope_id = workspace.scope_id if workspace is not None else None
+    effective_cwd = (
+        workspace.ensure().resolve()
+        if workspace is not None
+        else Path(cwd or os.getcwd()).expanduser().resolve()
+    )
+    run_id, _ = store.create_run(scope_id)
+    stdout_path = store.file_path(run_id, "stdout", scope_id)
+    stderr_path = store.file_path(run_id, "stderr", scope_id)
     protected = [store.runs_dir]
     if config_path is not None:
         protected.append(config_path.expanduser().resolve())
@@ -148,7 +154,7 @@ async def run_command(
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=out_f,
                 stderr=err_f,
-                cwd=cwd,
+                cwd=str(effective_cwd),
             )
         except FileNotFoundError as e:
             err_f.write(f"rcm: executable not found: {e}\n".encode())
@@ -194,12 +200,13 @@ async def run_command(
         timed_out=timed_out,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        scope_id=scope_id,
     )
     if spec.collect is not None:
         outcome = await collector.collect(
             spec.collect,
             cwd=effective_cwd,
-            destination=store.file_path(run_id, "collect"),
+            destination=store.file_path(run_id, "collect", scope_id),
             protected_paths=protected_paths,
             prepared=preparation,
             command_started=not spawn_failed,
@@ -213,8 +220,8 @@ async def run_command(
             }
         if outcome.warnings:
             meta["warnings"] = list(outcome.warnings)
-    result = _public_result(meta, store)
-    store.write_meta(run_id, {**meta, **result})
+    result = _public_result(meta, store, scope_id)
+    store.write_meta(run_id, {**meta, **result}, scope_id)
     return result
 
 
@@ -231,8 +238,9 @@ def _build_meta(
     timed_out: bool,
     stdout_path,
     stderr_path,
+    scope_id: str | None,
 ) -> dict[str, Any]:
-    return {
+    meta = {
         "run_id": run_id,
         "command_name": spec.name,
         "argv": argv,
@@ -251,6 +259,9 @@ def _build_meta(
             "sha256": sha256_file(stderr_path),
         },
     }
+    if scope_id is not None:
+        meta["scope_id"] = scope_id
+    return meta
 
 
 def _safe_size(path) -> int:
@@ -260,11 +271,13 @@ def _safe_size(path) -> int:
         return 0
 
 
-def _public_result(meta: dict[str, Any], store: Store) -> dict[str, Any]:
+def _public_result(
+    meta: dict[str, Any], store: Store, scope_id: str | None = None
+) -> dict[str, Any]:
     run_id = meta["run_id"]
     artifacts = {
         name: ArtifactDescriptor(
-            uri=store.url_for(run_id, name),
+            uri=store.url_for(run_id, name, scope_id),
             bytes=meta[name]["bytes"],
             sha256=meta[name]["sha256"],
         )

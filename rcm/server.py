@@ -26,6 +26,7 @@ from .runner import run_command
 from .proxy import ProxyError, ProxyRuntime
 from .store import RUN_ID_RE, Store
 from .tls import TLSConfigError, prepare_tls, uvicorn_tls_config
+from .workspace import ScopeResolver
 
 PY_TYPES: dict[str, type] = {
     "string": str,
@@ -41,6 +42,7 @@ def _build_tool_fn(
     default_cwd: str | None,
     store: Store,
     config_path: Path | None = None,
+    scope_resolver: ScopeResolver | None = None,
 ):
     """Synthesize an `async def <spec.name>(...)` function whose signature matches spec.params."""
     params: list[inspect.Parameter] = []
@@ -60,6 +62,11 @@ def _build_tool_fn(
     annotations["return"] = dict
 
     async def _impl(**kwargs):
+        workspace = (
+            scope_resolver.resolve(spec.isolate)
+            if scope_resolver is not None
+            else None
+        )
         return await run_command(
             spec,
             kwargs,
@@ -67,6 +74,7 @@ def _build_tool_fn(
             default_timeout=default_timeout,
             default_cwd=default_cwd,
             config_path=config_path,
+            workspace=workspace,
         )
 
     _impl.__name__ = spec.name
@@ -155,6 +163,23 @@ def _register_download_routes(mcp: FastMCP, store: Store) -> None:
             return _not_found("meta not readable")
         return JSONResponse(data)
 
+    @mcp.custom_route("/runs/{scope_id}/{run_id}/meta", methods=["GET"])
+    async def scoped_meta_route(request: Request) -> Response:
+        run_id = request.path_params["run_id"]
+        scope_id = request.path_params["scope_id"]
+        if not RUN_ID_RE.fullmatch(run_id):
+            return _bad_request("invalid run_id")
+        try:
+            path = store.file_path(run_id, "meta", scope_id)
+        except Exception:
+            return _bad_request("invalid scope_id")
+        if not path.is_file():
+            return _not_found("meta not found")
+        try:
+            return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            return _not_found("meta not readable")
+
     @mcp.custom_route("/runs/{run_id}/{artifact}", methods=["GET"])
     async def artifact_route(request: Request) -> Response:
         run_id = request.path_params["run_id"]
@@ -166,12 +191,42 @@ def _register_download_routes(mcp: FastMCP, store: Store) -> None:
             return _not_found("unknown artifact")
         return _serve_artifact(store.file_path(run_id, artifact), request, kind)
 
+    @mcp.custom_route("/runs/{scope_id}/{run_id}/{artifact}", methods=["GET"])
+    async def scoped_artifact_route(request: Request) -> Response:
+        run_id = request.path_params["run_id"]
+        scope_id = request.path_params["scope_id"]
+        if not RUN_ID_RE.fullmatch(run_id):
+            return _bad_request("invalid run_id")
+        artifact = request.path_params["artifact"]
+        kind = ARTIFACT_KINDS.get(artifact)
+        if kind is None:
+            return _not_found("unknown artifact")
+        try:
+            path = store.file_path(run_id, artifact, scope_id)
+        except Exception:
+            return _bad_request("invalid scope_id")
+        return _serve_artifact(path, request, kind)
+
     @mcp.custom_route("/healthz", methods=["GET"])
     async def healthz(_: Request) -> Response:
         return PlainTextResponse("ok")
 
 
-def _register_command_tools(mcp: FastMCP, cfg: Config, store: Store) -> None:
+def _isolation_meta(spec: CommandSpec) -> dict[str, Any] | None:
+    if spec.isolate is None:
+        return None
+    data: dict[str, Any] = {"by": spec.isolate.by}
+    if spec.isolate.base_dir is not None:
+        data["base_dir"] = spec.isolate.base_dir
+    return {"rcm": {"isolate": data}}
+
+
+def _register_command_tools(
+    mcp: FastMCP,
+    cfg: Config,
+    store: Store,
+    scope_resolver: ScopeResolver,
+) -> None:
     for spec in cfg.commands:
         fn = _build_tool_fn(
             spec,
@@ -179,8 +234,9 @@ def _register_command_tools(mcp: FastMCP, cfg: Config, store: Store) -> None:
             cfg.defaults.cwd,
             store,
             cfg.config_path,
+            scope_resolver,
         )
-        mcp.tool(fn)
+        mcp.tool(fn, meta=_isolation_meta(spec))
 
 
 def build_server(cfg: Config, store: Store, api_key: str | None) -> FastMCP:
@@ -191,7 +247,7 @@ def build_server(cfg: Config, store: Store, api_key: str | None) -> FastMCP:
     )
     if api_key is not None:
         mcp.add_middleware(ApiKeyAuth(api_key))
-    _register_command_tools(mcp, cfg, store)
+    _register_command_tools(mcp, cfg, store, ScopeResolver())
     _register_download_routes(mcp, store)
     return mcp
 
@@ -202,7 +258,7 @@ async def build_proxy_server(
     """Build a server with local commands and discovered proxy tools."""
     runtime = await ProxyRuntime.create(cfg, api_key, store)
     try:
-        _register_command_tools(runtime.server, cfg, store)
+        _register_command_tools(runtime.server, cfg, store, runtime.scope_resolver)
         _register_download_routes(runtime.server, store)
     except Exception:
         await runtime.close()
