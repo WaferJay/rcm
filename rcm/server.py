@@ -19,7 +19,13 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 from . import __version__
-from .artifacts import ARTIFACT_KINDS, ArtifactKind, RCM_EXPERIMENTAL_CAPABILITIES
+from .artifacts import (
+    ARTIFACT_KINDS,
+    ArtifactKind,
+    RCM_EXPERIMENTAL_CAPABILITIES,
+    RCM_SESSION_SCOPE_RESOURCE_URI,
+    RCM_SESSION_SCOPE_SCHEMA,
+)
 from .auth import ApiKeyAuth
 from .config import CommandSpec, Config, ParamSpec, TLSConfig, load_config
 from .runner import run_command
@@ -254,6 +260,22 @@ def _register_command_tools(
         mcp.tool(fn, meta=_isolation_meta(spec, cfg.defaults.cwd))
 
 
+def _register_workspace_resources(mcp: FastMCP, scope_resolver: ScopeResolver) -> None:
+    """Expose the current HTTP MCP session's opaque RCM workspace scope."""
+
+    @mcp.resource(
+        RCM_SESSION_SCOPE_RESOURCE_URI,
+        name="rcm_workspace_session",
+        description="Internal RCM workspace session scope.",
+        mime_type="application/json",
+    )
+    def session_scope() -> dict[str, str]:
+        return {
+            "schema": RCM_SESSION_SCOPE_SCHEMA,
+            "scope_id": scope_resolver.session_scope_id(),
+        }
+
+
 def build_server(cfg: Config, store: Store, api_key: str | None) -> FastMCP:
     mcp: FastMCP = FastMCP(
         "rcm",
@@ -262,7 +284,9 @@ def build_server(cfg: Config, store: Store, api_key: str | None) -> FastMCP:
     )
     if api_key is not None:
         mcp.add_middleware(ApiKeyAuth(api_key))
-    _register_command_tools(mcp, cfg, store, ScopeResolver())
+    scope_resolver = ScopeResolver()
+    _register_command_tools(mcp, cfg, store, scope_resolver)
+    _register_workspace_resources(mcp, scope_resolver)
     _register_download_routes(mcp, store)
     return mcp
 
@@ -274,6 +298,7 @@ async def build_proxy_server(
     runtime = await ProxyRuntime.create(cfg, api_key, store)
     try:
         _register_command_tools(runtime.server, cfg, store, runtime.scope_resolver)
+        _register_workspace_resources(runtime.server, runtime.scope_resolver)
         _register_download_routes(runtime.server, store)
     except Exception:
         await runtime.close()

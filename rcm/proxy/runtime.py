@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import AsyncExitStack
 from typing import Any, Awaitable, Callable
 
@@ -15,13 +16,16 @@ from ..artifacts import (
     RCM_CAPABILITY,
     RCM_EXPERIMENTAL_CAPABILITIES,
     RCM_PROTOCOL_VERSION,
+    RCM_SESSION_SCOPE_RESOURCE_URI,
+    RCM_SESSION_SCOPE_SCHEMA,
     RCM_WORKSPACE_CAPABILITY,
     RCM_WORKSPACE_PROTOCOL_VERSION,
+    RCM_WORKSPACE_SESSION_PROTOCOL_VERSION,
 )
 from ..auth import ApiKeyAuth
 from ..config import Config, ISOLATION_MODES, IsolationSpec
 from ..store import Store
-from ..workspace import ScopeResolver
+from ..workspace import SCOPE_ID_RE, ScopeResolver
 from ..sync import SyncError, SyncRunner
 from .connectors import ConnectorContext, _prepare_target
 from .errors import ProxyError
@@ -41,16 +45,84 @@ def _supports_rcm_v2(client: Client) -> bool:
     return isinstance(versions, list) and RCM_PROTOCOL_VERSION in versions
 
 
-def _supports_workspace_scopes(client: Client) -> bool:
+def _workspace_capability(client: Client) -> dict[str, Any] | None:
     initialized = client.initialize_result
     if initialized is None:
-        return False
+        return None
     experimental = initialized.capabilities.experimental or {}
     capability = experimental.get(RCM_WORKSPACE_CAPABILITY)
-    if not isinstance(capability, dict):
+    return capability if isinstance(capability, dict) else None
+
+
+def _supports_workspace_scopes(client: Client) -> bool:
+    capability = _workspace_capability(client)
+    if capability is None:
         return False
     versions = capability.get("versions")
     return isinstance(versions, list) and RCM_WORKSPACE_PROTOCOL_VERSION in versions
+
+
+def _session_scope_resource_uri(client: Client) -> str | None:
+    """Return the advertised resource used to resolve an HTTP session scope."""
+    capability = _workspace_capability(client)
+    if capability is None:
+        return None
+    versions = capability.get("versions")
+    if (
+        not isinstance(versions, list)
+        or RCM_WORKSPACE_SESSION_PROTOCOL_VERSION not in versions
+    ):
+        return None
+    uri = capability.get("sessionScopeResource")
+    if isinstance(uri, str) and uri == RCM_SESSION_SCOPE_RESOURCE_URI:
+        return uri
+    return None
+
+
+async def _remote_session_scope(client: Client, target_name: str) -> str:
+    """Read and validate the remote HTTP MCP session's opaque RCM scope."""
+    uri = _session_scope_resource_uri(client)
+    if uri is None:
+        raise ProxyError(
+            f"proxy target {target_name!r} exposes session-isolated tools but "
+            "does not support RCM workspace protocol v2 remote session scopes"
+        )
+    try:
+        contents = await client.read_resource(uri)
+    except Exception as exc:
+        raise ProxyError(
+            f"proxy target {target_name!r} failed to resolve its remote MCP "
+            f"session workspace: {exc}"
+        ) from exc
+    if not isinstance(contents, list) or len(contents) != 1:
+        raise ProxyError(
+            f"proxy target {target_name!r} returned an invalid remote MCP "
+            "session workspace response"
+        )
+    text = getattr(contents[0], "text", None)
+    if not isinstance(text, str):
+        raise ProxyError(
+            f"proxy target {target_name!r} returned an invalid remote MCP "
+            "session workspace response"
+        )
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProxyError(
+            f"proxy target {target_name!r} returned an invalid remote MCP "
+            "session workspace response"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != RCM_SESSION_SCOPE_SCHEMA
+        or not isinstance(value.get("scope_id"), str)
+        or not SCOPE_ID_RE.fullmatch(value["scope_id"])
+    ):
+        raise ProxyError(
+            f"proxy target {target_name!r} returned an invalid remote MCP "
+            "session workspace response"
+        )
+    return value["scope_id"]
 
 
 def _remote_isolation(tool: Any) -> IsolationSpec | None:
@@ -198,6 +270,29 @@ class ProxyRuntime:
                     raise ProxyError(
                         f"proxy target {target.name!r} failed to discover tools: {exc}"
                     ) from exc
+                remote_isolations = {
+                    id(remote_tool): _remote_isolation(remote_tool)
+                    for remote_tool in remote_tools
+                }
+                remote_session_scope_id = None
+                if any(
+                    isolate is not None and isolate.by == "session"
+                    for isolate in remote_isolations.values()
+                ):
+                    if target.transport != "http":
+                        raise ProxyError(
+                            f"proxy target {target.name!r} exposes session-isolated "
+                            "tools but remote session workspaces require an HTTP RCM "
+                            "target"
+                        )
+                    if not rcm_peer or not workspace_peer:
+                        raise ProxyError(
+                            f"proxy target {target.name!r} exposes session-isolated "
+                            "tools but does not support the RCM workspace protocol"
+                        )
+                    remote_session_scope_id = await _remote_session_scope(
+                        client, target.name
+                    )
                 failure_reporter = None
                 if prepared.monitor is not None:
                     failure_reporter = lambda exc, name=target.name: report_failure(
@@ -213,7 +308,7 @@ class ProxyRuntime:
                     output_schema = getattr(remote_tool, "outputSchema", None)
                     if not isinstance(output_schema, dict):
                         output_schema = None
-                    isolate = _remote_isolation(remote_tool)
+                    isolate = remote_isolations[id(remote_tool)]
                     server.add_tool(
                         ProxyTool(
                             public_name=public_name,
@@ -236,6 +331,7 @@ class ProxyRuntime:
                             scope_resolver=scope_resolver,
                             isolate=isolate,
                             workspace_peer=workspace_peer,
+                            remote_session_scope_id=remote_session_scope_id,
                         )
                     )
                 if prepared.monitor is not None:

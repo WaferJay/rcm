@@ -14,6 +14,9 @@ RCM_CAPABILITY = "rcm.artifacts"
 RCM_WORKSPACE_CAPABILITY = "rcm.workspace"
 RCM_PROTOCOL_VERSION = 2
 RCM_WORKSPACE_PROTOCOL_VERSION = 1
+RCM_WORKSPACE_SESSION_PROTOCOL_VERSION = 2
+RCM_SESSION_SCOPE_RESOURCE_URI = "rcm://workspace/session"
+RCM_SESSION_SCOPE_SCHEMA = "rcm.workspace-session/v1"
 RCM_CALL_META: dict[str, Any] = {
     "rcm": {"artifacts": {"version": RCM_PROTOCOL_VERSION}}
 }
@@ -73,7 +76,13 @@ RCM_EXPERIMENTAL_CAPABILITIES: dict[str, dict[str, Any]] = {
         "uriSchemes": ["file", "http", "https"],
         "artifactKinds": list(ARTIFACT_KINDS),
     },
-    RCM_WORKSPACE_CAPABILITY: {"versions": [RCM_WORKSPACE_PROTOCOL_VERSION]},
+    RCM_WORKSPACE_CAPABILITY: {
+        "versions": [
+            RCM_WORKSPACE_PROTOCOL_VERSION,
+            RCM_WORKSPACE_SESSION_PROTOCOL_VERSION,
+        ],
+        "sessionScopeResource": RCM_SESSION_SCOPE_RESOURCE_URI,
+    },
 }
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import inspect
+import json
 import os
 import sys
 import tarfile
@@ -15,6 +16,10 @@ import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 
+from rcm.artifacts import (
+    RCM_SESSION_SCOPE_RESOURCE_URI,
+    RCM_SESSION_SCOPE_SCHEMA,
+)
 from rcm.config import (
     AuthSpec,
     CollectPathSpec,
@@ -220,6 +225,9 @@ async def test_server_advertises_rcm_v2_without_internal_tools(running_server) -
     assert initialized.capabilities.experimental["rcm.artifacts"]["versions"] == [2]
     capability = initialized.capabilities.experimental["rcm.artifacts"]
     assert capability["artifactKinds"] == ["stdout", "stderr", "collect"]
+    workspace = initialized.capabilities.experimental["rcm.workspace"]
+    assert workspace["versions"] == [1, 2]
+    assert workspace["sessionScopeResource"] == RCM_SESSION_SCOPE_RESOURCE_URI
     assert {tool.name for tool in tools} == {
         "echo_hi",
         "echo_arg",
@@ -227,6 +235,32 @@ async def test_server_advertises_rcm_v2_without_internal_tools(running_server) -
         "session_workspace",
         "ip_workspace",
     }
+
+
+async def test_session_scope_resource_tracks_the_http_mcp_session(
+    running_server,
+) -> None:
+    def parse_scope(contents) -> str:
+        assert len(contents) == 1
+        value = json.loads(contents[0].text)
+        assert value["schema"] == RCM_SESSION_SCOPE_SCHEMA
+        assert value["scope_id"].startswith("scope-")
+        return value["scope_id"]
+
+    client = make_client(running_server["url"], "testkey")
+    async with client:
+        first = parse_scope(await client.read_resource(RCM_SESSION_SCOPE_RESOURCE_URI))
+        second = parse_scope(await client.read_resource(RCM_SESSION_SCOPE_RESOURCE_URI))
+        tool_result = await client.call_tool("session_workspace", {})
+    other_client = make_client(running_server["url"], "testkey")
+    async with other_client:
+        other = parse_scope(
+            await other_client.read_resource(RCM_SESSION_SCOPE_RESOURCE_URI)
+        )
+
+    assert first == second
+    assert first != other
+    assert urlparse(tool_result.data["stdout"]["uri"]).path.split("/")[-3] == first
 
 
 async def test_list_tools_without_key_rejected(running_server) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import socket
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import pytest
@@ -17,11 +18,15 @@ from rcm.config import (
     CommandSpec,
     Config,
     DefaultsSpec,
+    IsolationSpec,
     ProxySpec,
     ProxyTargetSpec,
     ServerSpec,
+    SyncMappingSpec,
+    SyncSpec,
 )
 from rcm.proxy import ProxyError
+from rcm.proxy.runtime import _remote_session_scope
 from rcm.server import build_proxy_server, build_server
 from rcm.store import Store
 
@@ -66,6 +71,22 @@ async def test_proxy_runtime_wraps_initial_connection_failure(
             Store(tmp_path / "runs", (tmp_path / "runs").as_uri()),
             None,
         )
+
+
+@pytest.mark.asyncio
+async def test_remote_session_scope_requires_workspace_v2() -> None:
+    class LegacyWorkspaceClient:
+        initialize_result = SimpleNamespace(
+            capabilities=SimpleNamespace(
+                experimental={"rcm.workspace": {"versions": [1]}}
+            )
+        )
+
+        async def read_resource(self, uri: str):
+            raise AssertionError(f"unexpected resource read: {uri}")
+
+    with pytest.raises(ProxyError, match="workspace protocol v2"):
+        await _remote_session_scope(LegacyWorkspaceClient(), "remote")
 
 
 @pytest.mark.asyncio
@@ -281,6 +302,132 @@ async def test_proxy_runtime_bridges_streamable_http(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_session_isolated_target_uses_its_remote_session_workspace(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    base_url = f"http://127.0.0.1:{port}"
+    remote_work = tmp_path / "remote-work"
+    remote_work.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    remote = build_server(
+        Config(
+            server=ServerSpec(public_base_url=base_url),
+            auth=AuthSpec(api_key=None),
+            defaults=DefaultsSpec(cwd=str(remote_work)),
+            commands=[
+                CommandSpec(
+                    name="session_pwd",
+                    description="Print the isolated workspace.",
+                    command=[
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; print(Path.cwd())",
+                    ],
+                    isolate=IsolationSpec(by="session"),
+                )
+            ],
+        ),
+        Store(tmp_path / "remote-runs", base_url),
+        api_key=None,
+    )
+    remote_task = asyncio.create_task(
+        remote.run_async(
+            transport="http",
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+    )
+    deadline = asyncio.get_running_loop().time() + 5
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                break
+        except OSError:
+            if asyncio.get_running_loop().time() > deadline:
+                raise RuntimeError("remote HTTP RCM failed to start")
+            await asyncio.sleep(0.05)
+
+    synced_workspaces = []
+
+    async def capture_sync(_, workspace) -> None:
+        synced_workspaces.append(workspace)
+
+    monkeypatch.setattr("rcm.sync.SyncRunner.sync", capture_sync)
+    cfg = Config(
+        server=ServerSpec(),
+        auth=AuthSpec(api_key=None),
+        defaults=DefaultsSpec(),
+        commands=[],
+        proxy=ProxySpec(
+            targets=[
+                ProxyTargetSpec(
+                    name="remote",
+                    transport="http",
+                    endpoint=f"{base_url}/mcp",
+                    sync=SyncSpec(
+                        mappings=[
+                            SyncMappingSpec(source=str(source), destination=".")
+                        ]
+                    ),
+                )
+            ]
+        ),
+    )
+    runtime = None
+    try:
+        mcp, runtime = await build_proxy_server(
+            cfg,
+            Store(
+                tmp_path / "local-runs",
+                (tmp_path / "local-runs").as_uri(),
+                local_urls=True,
+            ),
+            None,
+        )
+        tool = await mcp.get_tool("remote__session_pwd")
+        assert tool is not None
+        first = await tool.run({})
+        second = await tool.run({})
+
+        scope_id = tool._remote_session_scope_id
+        assert scope_id is not None
+        expected = (remote_work / scope_id).resolve()
+        first_stdout = Path(
+            first.structured_content["stdout"]["uri"].removeprefix("file://")
+        )
+        second_stdout = Path(
+            second.structured_content["stdout"]["uri"].removeprefix("file://")
+        )
+        assert first_stdout.read_text().strip() == str(expected)
+        assert second_stdout.read_text().strip() == str(expected)
+        assert [workspace.scope_id for workspace in synced_workspaces] == [
+            scope_id,
+            scope_id,
+        ]
+        assert [workspace.base_dir for workspace in synced_workspaces] == [
+            remote_work,
+            remote_work,
+        ]
+    finally:
+        if runtime is not None:
+            await runtime.close()
+        remote_task.cancel()
+        try:
+            await remote_task
+        except BaseException:
+            pass
+
+
+@pytest.mark.asyncio
 async def test_http_rcm_target_localizes_or_passthroughs_artifacts(tmp_path) -> None:
     import sys
 
@@ -385,4 +532,3 @@ async def test_http_rcm_target_localizes_or_passthroughs_artifacts(tmp_path) -> 
             await remote_task
         except BaseException:
             pass
-

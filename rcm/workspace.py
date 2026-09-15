@@ -17,6 +17,8 @@ from pathlib import Path
 
 from .config.models import IsolationSpec
 
+SCOPE_ID_RE = re.compile(r"^scope-[A-Za-z0-9_-]+$")
+
 
 class WorkspaceError(RuntimeError):
     """Raised when an isolated command cannot establish its workspace."""
@@ -84,7 +86,7 @@ class ScopeResolver:
         rcm = self._value(meta, "rcm")
         workspace = self._value(rcm, "workspace")
         scope_id = self._value(workspace, "scope_id")
-        if isinstance(scope_id, str) and re.fullmatch(r"scope-[A-Za-z0-9_-]+", scope_id):
+        if isinstance(scope_id, str) and SCOPE_ID_RE.fullmatch(scope_id):
             return scope_id
         return None
 
@@ -138,3 +140,11 @@ class ScopeResolver:
         if not isinstance(session_id, str) or not session_id:
             raise WorkspaceError("could not determine the MCP session")
         return self._opaque_scope_id(session_id)
+
+    def session_scope_id(self) -> str:
+        """Return the opaque scope for the active HTTP MCP session.
+
+        Proxies use this through the reserved RCM workspace resource before
+        synchronizing files into a session-isolated remote workspace.
+        """
+        return self._from_session()

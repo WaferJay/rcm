@@ -49,6 +49,7 @@ class ProxyTool(Tool):
     _isolate: IsolationSpec | None = PrivateAttr()
     _scope_resolver: ScopeResolver | None = PrivateAttr()
     _workspace_peer: bool = PrivateAttr()
+    _remote_session_scope_id: str | None = PrivateAttr()
 
     def __init__(
         self,
@@ -71,6 +72,7 @@ class ProxyTool(Tool):
         isolate: IsolationSpec | None = None,
         scope_resolver: ScopeResolver | None = None,
         workspace_peer: bool = False,
+        remote_session_scope_id: str | None = None,
     ) -> None:
         super().__init__(
             name=public_name,
@@ -96,6 +98,7 @@ class ProxyTool(Tool):
         self._isolate = isolate
         self._scope_resolver = scope_resolver
         self._workspace_peer = workspace_peer
+        self._remote_session_scope_id = remote_session_scope_id
 
     @staticmethod
     def _isolation_meta(isolate: IsolationSpec | None) -> dict[str, Any] | None:
@@ -120,7 +123,9 @@ class ProxyTool(Tool):
         try:
             call_kwargs: dict[str, Any] = {}
             if self._rcm_peer:
-                call_kwargs["meta"] = self._call_meta(workspace)
+                call_kwargs["meta"] = self._call_meta(
+                    None if self._uses_remote_session_scope() else workspace
+                )
             result = await self._client.call_tool_mcp(
                 self._remote_name, arguments or {}, **call_kwargs
             )
@@ -174,9 +179,23 @@ class ProxyTool(Tool):
             raise ArtifactError(
                 "isolated proxy tool requires a downstream RCM workspace capability"
             )
+        if self._uses_remote_session_scope():
+            if self._isolate.base_dir is None:
+                raise ArtifactError("session-isolated proxy tool has no base directory")
+            return Workspace(
+                scope_id=self._remote_session_scope_id,
+                base_dir=Path(self._isolate.base_dir),
+            )
         if self._scope_resolver is None:
             raise ArtifactError("isolated proxy tool has no scope resolver")
         return self._scope_resolver.resolve(self._isolate)
+
+    def _uses_remote_session_scope(self) -> bool:
+        return (
+            self._isolate is not None
+            and self._isolate.by == "session"
+            and self._remote_session_scope_id is not None
+        )
 
     @staticmethod
     def _call_meta(workspace: Workspace | None) -> dict[str, Any]:

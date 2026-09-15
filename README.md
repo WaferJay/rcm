@@ -182,10 +182,12 @@ commands:
 
 Enabled `isolate` cannot be combined with command `cwd`. `ip` uses the HTTP
 TCP peer address (forwarding headers are not trusted), `session` uses the MCP
-HTTP session, and `call` creates a workspace for every invocation. StdIO and
-direct CLI calls cannot use `ip` or `session`. Isolated artifacts are stored
-and returned under `/runs/<opaque-scope-id>/<run-id>/...`; these remain
-capability URLs, not authenticated download URLs.
+HTTP session, and `call` creates a workspace for every invocation. Local
+stdio and direct CLI calls cannot use `ip` or a locally configured `session`
+workspace. A proxy can call a session-isolated HTTP RCM target through the
+target's own MCP session (see proxy synchronization below). Isolated artifacts
+are stored and returned under `/runs/<opaque-scope-id>/<run-id>/...`; these
+remain capability URLs, not authenticated download URLs.
 
 ### Collecting command files
 
@@ -335,8 +337,13 @@ under `sync` remain supported, but cannot be mixed with `mappings`.
 
 When the discovered remote command configures `isolate`, every sync
 `destination` must instead be a relative POSIX path (use `.` for the workspace
-root). rcm resolves it below that command's isolated `base_dir` and forwards
-the same opaque scope ID to the remote RCM before invoking the tool.
+root). rcm resolves it below that command's isolated `base_dir`. For a remote
+HTTP command with `isolate.by: session`, rcm first reads the remote RCM's
+workspace-v2 session resource through the same MCP connection, synchronizes
+to the returned scope, and then invokes the tool normally. The remote command
+therefore derives the same scope from its own HTTP MCP session; no workspace
+parameter is added to the tool call. Other isolation modes continue to forward
+their opaque scope ID to the remote RCM.
 
 For `ssh` plus `config`, a relative destination is resolved below the remote
 `defaults.cwd`, falling back to the directory containing the remote config.

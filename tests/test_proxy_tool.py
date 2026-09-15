@@ -5,13 +5,17 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 from mcp.types import CallToolResult, TextContent
 
+from rcm.artifacts import RCM_CALL_META
+from rcm.config import IsolationSpec
 from rcm.proxy import ProxyTool
 from rcm.store import Store
 from rcm.sync import SyncError
+from rcm.workspace import Workspace
 
 
 class FakeClient:
@@ -77,6 +81,51 @@ async def test_proxy_tool_blocks_call_when_sync_fails() -> None:
     with pytest.raises(Exception, match="sync failed"):
         await tool.run({})
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_proxy_tool_uses_remote_session_workspace_without_forwarding_scope(
+) -> None:
+    class RemoteClient:
+        def __init__(self) -> None:
+            self.meta: dict | None = None
+
+        async def call_tool_mcp(self, name: str, arguments: dict, *, meta: dict):
+            self.meta = meta
+            return CallToolResult(
+                content=[TextContent(type="text", text="remote result")]
+            )
+
+    class CapturingSync:
+        def __init__(self) -> None:
+            self.workspace: Workspace | None = None
+
+        async def sync(self, workspace: Workspace) -> None:
+            self.workspace = workspace
+
+    client = RemoteClient()
+    sync = CapturingSync()
+    tool = ProxyTool(
+        public_name="compile__build",
+        target_name="compile",
+        remote_name="build",
+        description=None,
+        parameters={"type": "object", "properties": {}},
+        output_schema=None,
+        client=client,
+        sync=sync,
+        rcm_peer=True,
+        isolate=IsolationSpec(by="session", base_dir="/srv/rcm/workspaces"),
+        workspace_peer=True,
+        remote_session_scope_id="scope-remote-session",
+    )
+
+    await tool.run({})
+
+    assert sync.workspace == Workspace(
+        "scope-remote-session", Path("/srv/rcm/workspaces")
+    )
+    assert client.meta == RCM_CALL_META
 
 
 @pytest.mark.asyncio
@@ -324,4 +373,3 @@ async def test_failed_localization_removes_staging_run(tmp_path) -> None:
     with pytest.raises(Exception, match="SHA-256 mismatch"):
         await tool.run({})
     assert list(store.runs_dir.iterdir()) == []
-
