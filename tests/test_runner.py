@@ -175,6 +175,43 @@ async def test_run_command_uses_workspace_for_cwd_and_artifacts(tmp_path: Path) 
     assert store.file_path(result["run_id"], "stdout", workspace.scope_id).read_text().strip() == str(expected)
 
 
+async def test_run_command_substitutes_workspace_in_argv_and_meta(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    workspace = Workspace("scope-test", tmp_path / "workspaces")
+    spec = make_spec(
+        "workspace_args",
+        [
+            sys.executable,
+            "-c",
+            "import json, sys; print(json.dumps(sys.argv[1:]))",
+            "{workspace}",
+            "{workspace}:/workspace",
+        ],
+    )
+
+    result = await run_command(
+        spec,
+        {},
+        store=store,
+        default_timeout=10,
+        default_cwd=None,
+        workspace=workspace,
+    )
+
+    expected = str(workspace.cwd.resolve())
+    stdout_path = store.file_path(result["run_id"], "stdout", workspace.scope_id)
+    assert json.loads(stdout_path.read_text()) == [
+        expected,
+        f"{expected}:/workspace",
+    ]
+    meta_path = store.file_path(result["run_id"], "meta", workspace.scope_id)
+    meta = json.loads(meta_path.read_text())
+    assert meta["argv"][-2:] == [expected, f"{expected}:/workspace"]
+    assert meta["params"] == {}
+
+
 async def test_run_command_returns_binary_safe_v2_artifacts(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     spec = make_spec(

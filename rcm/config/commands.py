@@ -18,6 +18,7 @@ from .models import (
     ISOLATION_MODES,
     IsolationSpec,
     ParamSpec,
+    WORKSPACE_PLACEHOLDER,
 )
 
 
@@ -210,21 +211,40 @@ def _parse_command(raw: dict[str, Any]) -> CommandSpec:
                 f"got {type(part).__name__}"
             )
 
+    cwd = raw.get("cwd")
+    if cwd is not None and not isinstance(cwd, str):
+        raise ConfigError(f"command {name!r}: cwd must be a string")
+    isolate = _parse_isolate(raw.get("isolate"), name, cwd)
+
     params_raw = raw.get("params") or {}
     if not isinstance(params_raw, dict):
         raise ConfigError(f"command {name!r}: `params` must be a mapping")
+    if WORKSPACE_PLACEHOLDER in params_raw:
+        raise ConfigError(
+            f"command {name!r}: params.{WORKSPACE_PLACEHOLDER} is reserved "
+            "for the isolated workspace path"
+        )
     params = [_parse_param(pname, pspec) for pname, pspec in params_raw.items()]
     declared = {param.name for param in params}
 
     used: set[str] = set()
+    uses_workspace = False
     for part in command:
         for placeholder in _placeholders(part):
-            if placeholder not in declared:
+            if placeholder == WORKSPACE_PLACEHOLDER:
+                uses_workspace = True
+            elif placeholder not in declared:
                 raise ConfigError(
                     f"command {name!r}: placeholder {{{placeholder}}} "
                     "has no matching params entry"
                 )
-            used.add(placeholder)
+            else:
+                used.add(placeholder)
+    if uses_workspace and (isolate is None or isolate.by == "none"):
+        raise ConfigError(
+            f"command {name!r}: placeholder {{{WORKSPACE_PLACEHOLDER}}} "
+            "requires enabled isolate"
+        )
     unused = declared - used
     if unused:
         raise ConfigError(
@@ -234,10 +254,6 @@ def _parse_command(raw: dict[str, Any]) -> CommandSpec:
     timeout = raw.get("timeout")
     if timeout is not None and not isinstance(timeout, (int, float)):
         raise ConfigError(f"command {name!r}: timeout must be a number")
-    cwd = raw.get("cwd")
-    if cwd is not None and not isinstance(cwd, str):
-        raise ConfigError(f"command {name!r}: cwd must be a string")
-    isolate = _parse_isolate(raw.get("isolate"), name, cwd)
 
     return CommandSpec(
         name=name,

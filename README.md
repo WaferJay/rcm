@@ -156,7 +156,8 @@ Rules:
 
 - `command` must be a **list** (argv form). String form is rejected.
 - `{name}` placeholders may only appear inside argv elements and must be
-  declared in `params`.
+  declared in `params`. The reserved `{workspace}` placeholder is supplied by
+  rcm for commands with isolation enabled and cannot be declared as a param.
 - `params[*].type` is one of `string`, `integer`, `number`, `boolean`.
 - Optional per-param: `description`, `default`, `pattern` (regex), `enum`.
 - `name` must match `^[a-zA-Z_][a-zA-Z0-9_]*$` and be globally unique.
@@ -170,11 +171,27 @@ uses `defaults.cwd`, then its current directory. rcm creates an opaque child
 directory below that root and uses it as the command's effective cwd.
 Like `cwd`, a relative `base_dir` is resolved from rcm's current directory.
 
+For an isolated command, `{workspace}` expands to the absolute effective cwd.
+It can be a complete argv element or part of one, such as the host side of a
+Docker bind mount. Expansion remains argv-based with `shell=False`. If Docker
+uses a remote daemon, the expanded host path must also exist on that daemon's
+host.
+
 ```yaml
 commands:
   - name: build
     description: Build in a session-specific workspace.
-    command: [make, build]
+    command:
+      - /usr/bin/docker
+      - run
+      - --rm
+      - -v
+      - "{workspace}:/workspace"
+      - -w
+      - /workspace
+      - build-image
+      - make
+      - build
     isolate:
       by: session  # none (default), ip, session, or call
       base_dir: /srv/rcm/workspaces

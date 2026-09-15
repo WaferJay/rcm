@@ -109,3 +109,5 @@ commands:
   #   # isolate:
   #   #   by: session  # none, ip, session, or call
   #   #   base_dir: /srv/rcm/workspaces
+  #   # In command argv, `{workspace}` is the absolute isolated path; for
+  #   # example, Docker can use: -v "{workspace}:/workspace"

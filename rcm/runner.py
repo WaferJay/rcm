@@ -19,6 +19,7 @@ from .artifacts import (
 )
 from .collection import ArtifactCollector, DEFAULT_COLLECTOR
 from .config import CommandSpec, ParamSpec
+from .config.models import WORKSPACE_PLACEHOLDER
 from .store import Store
 from .workspace import Workspace
 
@@ -115,7 +116,6 @@ async def run_command(
 ) -> dict[str, Any]:
     """Execute one configured command, capturing output to disk."""
     resolved = _resolve_params(spec, supplied_params)
-    argv = _substitute(spec.command, resolved)
 
     timeout = spec.timeout if spec.timeout is not None else default_timeout
     cwd = spec.cwd if spec.cwd is not None else default_cwd
@@ -126,6 +126,10 @@ async def run_command(
         if workspace is not None
         else Path(cwd or os.getcwd()).expanduser().resolve()
     )
+    substitutions = dict(resolved)
+    if workspace is not None:
+        substitutions[WORKSPACE_PLACEHOLDER] = str(effective_cwd)
+    argv = _substitute(spec.command, substitutions)
     run_id, _ = store.create_run(scope_id)
     stdout_path = store.file_path(run_id, "stdout", scope_id)
     stderr_path = store.file_path(run_id, "stderr", scope_id)

@@ -131,6 +131,60 @@ def test_command_isolate_parses_command_workspace_contract(tmp_path: Path) -> No
     assert isolate.base_dir == "/srv/rcm/workspaces"
 
 
+def test_command_isolate_accepts_builtin_workspace_placeholder(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            commands:
+              - name: build
+                description: Build in Docker.
+                command: [docker, run, "{workspace}:/workspace", image]
+                isolate: {by: call, base_dir: /srv/rcm/workspaces}
+            """,
+        )
+    )
+
+    assert cfg.commands[0].params == []
+
+
+@pytest.mark.parametrize("isolate", ["", "isolate: {by: none}"])
+def test_workspace_placeholder_requires_enabled_isolate(
+    tmp_path: Path, isolate: str
+) -> None:
+    with pytest.raises(ConfigError, match="requires enabled isolate"):
+        load_config(
+            write(
+                tmp_path,
+                f"""
+                commands:
+                  - name: build
+                    description: Build in Docker.
+                    command: [docker, run, "{{workspace}}:/workspace", image]
+                    {isolate}
+                """,
+            )
+        )
+
+
+def test_workspace_param_name_is_reserved(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match=r"params\.workspace is reserved"):
+        load_config(
+            write(
+                tmp_path,
+                """
+                commands:
+                  - name: build
+                    description: Build in Docker.
+                    command: [docker, run, "{workspace}:/workspace", image]
+                    params:
+                      workspace: {type: string}
+                    isolate: {by: call}
+                """,
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "body, fragment",
     [

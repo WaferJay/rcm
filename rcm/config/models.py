@@ -15,6 +15,7 @@ SERVER_TRANSPORTS = {"http", "stdio"}
 COLLECT_ON_EXIT = {"success", "always"}
 COLLECT_MODES = {"always", "changed"}
 ISOLATION_MODES = {"none", "ip", "session", "call"}
+WORKSPACE_PLACEHOLDER = "workspace"
 
 
 class ConfigError(ValueError):
