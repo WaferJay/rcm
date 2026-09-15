@@ -126,6 +126,10 @@ def test_scoped_sync_destination_is_relative_to_workspace_base(tmp_path: Path) -
     )
     workspace = Workspace("scope-client", Path("/srv/rcm/workspaces"))
     command = SyncRunner(target)._command(mapping, tmp_path, workspace)
+    assert (
+        "--rsync-path=mkdir -p -- /srv/rcm/workspaces/scope-client/src && rsync"
+        in command
+    )
     assert command[-1] == "compile-machine:/srv/rcm/workspaces/scope-client/src/"
 
 
@@ -144,6 +148,39 @@ def test_scoped_remote_mapping_uses_relative_destination(tmp_path: Path) -> None
     workspace = Workspace("scope-client", Path("/srv/rcm/workspaces"))
     command = SyncRunner(target)._command(mapping, tmp_path, workspace)
     assert command[-1] == "compile-machine:/srv/rcm/workspaces/scope-client/backend/"
+
+
+def test_remote_sync_quotes_destination_when_creating_it(tmp_path: Path) -> None:
+    mapping = SyncMappingSpec(
+        source=str(tmp_path),
+        destination="/srv/project with spaces/source",
+    )
+    target = ProxyTargetSpec(
+        name="compile",
+        transport="ssh",
+        ssh=SSHSpec(host="compile-machine", command=["rcm", "--stdio"]),
+        sync=_sync(mapping),
+    )
+
+    command = SyncRunner(target)._command(mapping, tmp_path)
+
+    assert (
+        "--rsync-path=mkdir -p -- '/srv/project with spaces/source' && rsync"
+        in command
+    )
+
+
+def test_local_sync_does_not_configure_remote_rsync_path(tmp_path: Path) -> None:
+    mapping = SyncMappingSpec(
+        source=str(tmp_path), destination=str(tmp_path / "nested" / "destination")
+    )
+    target = ProxyTargetSpec(
+        name="compile", transport="stdio", command=["echo"], sync=_sync(mapping)
+    )
+
+    command = SyncRunner(target)._command(mapping, tmp_path)
+
+    assert not any(part.startswith("--rsync-path=") for part in command)
 
 
 @pytest.mark.parametrize("destination", ["/srv/project", "../escape", "host:/srv/project"])

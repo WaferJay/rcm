@@ -350,8 +350,10 @@ For `ssh` plus `config`, a relative destination is resolved below the remote
 For an explicit SSH target it is relative to the SSH login directory, matching
 native rsync behavior. Local destinations are relative to the proxy process's
 working directory. Absolute paths and existing explicit `host:path`
-destinations retain their current meaning. Relative destination paths must use
-POSIX separators and cannot contain empty, `.`, or `..` components or `~`.
+destinations retain their current meaning. rcm creates missing remote
+destination directories before transferring files. Relative destination paths
+must use POSIX separators and cannot contain empty, `.`, or `..` components or
+`~`.
 
 `excludes` are relative POSIX globs and support `*`, `?`, character classes,
 and recursive `**`. In addition, rcm always protects the active local config,

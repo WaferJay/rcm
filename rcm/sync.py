@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import posixpath
+import shlex
 import shutil
 from pathlib import Path, PurePosixPath
 
@@ -182,6 +183,14 @@ class SyncRunner:
         workspace: Workspace | None = None,
     ) -> list[str]:
         command = ["rsync", "-a", "--compress"]
+        destination = self._destination(mapping, workspace)
+        destination_host, destination_path = _split_remote_destination(destination)
+        if destination_host is not None:
+            # Unlike a local transfer, the remote rsync receiver only creates
+            # the final destination component.  Prepare the complete path so
+            # isolated destinations such as <base>/<scope>/<mapping> also work.
+            remote_command = f"mkdir -p -- {shlex.quote(destination_path)} && rsync"
+            command.append(f"--rsync-path={remote_command}")
         for pattern in self._protected_patterns(mapping, source):
             command.extend(("--exclude", pattern))
         if mapping.delete:
@@ -190,7 +199,7 @@ class SyncRunner:
             (
                 "--",
                 _trailing_slash(str(source)),
-                _trailing_slash(self._destination(mapping, workspace)),
+                _trailing_slash(destination),
             )
         )
         return command
