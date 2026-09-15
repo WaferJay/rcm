@@ -236,15 +236,21 @@ def _remote_sync_spec(
         )
         return SyncSpec(
             mappings=[
-                SyncMappingSpec(source=source, destination=destination_base)
+                SyncMappingSpec(
+                    source=source,
+                    destination=destination_base,
+                    workspace_destination=".",
+                )
             ]
         )
 
     mappings: list[SyncMappingSpec] = []
     for mapping in configured.mappings:
         destination = mapping.destination
+        workspace_destination = destination
         if destination is None:
             destination = destination_base
+            workspace_destination = "."
         else:
             first_slash = destination.find("/")
             colon = destination.find(":")
@@ -256,6 +262,7 @@ def _remote_sync_spec(
                 mapping,
                 source=mapping.source or source,
                 destination=destination,
+                workspace_destination=workspace_destination,
             )
         )
     return replace(

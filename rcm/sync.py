@@ -90,6 +90,8 @@ class SyncRunner:
             )
         destination = mapping.destination.rstrip("/") or "/"
         if workspace is not None:
+            if mapping.workspace_destination is not None:
+                destination = mapping.workspace_destination
             destination = self._workspace_destination(destination, workspace)
         if self.target.ssh is not None:
             # Permit an explicit rsync host in the destination, otherwise use

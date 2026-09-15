@@ -111,6 +111,9 @@ class HeaderSpec:
 class SyncMappingSpec:
     source: str | None = None
     destination: str | None = None
+    # Populated only while resolving remote-config targets.  It retains the
+    # relative destination used when an invoked command is isolated.
+    workspace_destination: str | None = None
     excludes: list[str] = field(default_factory=list)
     delete: bool = False
 

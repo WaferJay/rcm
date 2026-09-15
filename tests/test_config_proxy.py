@@ -99,6 +99,30 @@ def test_load_multi_mapping_sync_config(tmp_path: Path) -> None:
     assert sync.mappings[1].delete is True
 
 
+def test_sync_mapping_accepts_workspace_root_destination(tmp_path: Path) -> None:
+    cfg = load_config(
+        write(
+            tmp_path,
+            """
+            proxy:
+              compile:
+                transport: ssh
+                ssh:
+                  host: compile-machine
+                  command: [rcm, --stdio]
+                sync:
+                  mappings:
+                    - source: ./source
+                      destination: .
+            """,
+        )
+    )
+
+    assert cfg.proxy is not None
+    assert cfg.proxy.targets[0].sync is not None
+    assert cfg.proxy.targets[0].sync.mappings[0].destination == "."
+
+
 def test_load_commands_and_proxy_together(tmp_path: Path) -> None:
     cfg = load_config(
         write(

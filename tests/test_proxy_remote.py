@@ -104,6 +104,7 @@ async def test_remote_http_config_resolves_without_stdio_discovery(
     mapping = resolved.sync.mappings[0]
     assert mapping.source == str(tmp_path)
     assert mapping.destination == "/srv/project"
+    assert mapping.workspace_destination == "."
     assert mapping.excludes == []
     assert mapping.delete is False
     assert "implicit full-directory sync" in caplog.text
@@ -348,12 +349,17 @@ async def test_remote_stdio_config_discovers_rcm_and_keeps_remote_config(
 
 
 @pytest.mark.parametrize(
-    "cwd, destination, expected",
+    "cwd, destination, expected, workspace_destination",
     [
-        ("/srv/project", "backend", "/srv/project/backend"),
-        (None, "backend", "/etc/rcm/backend"),
-        ("/srv/project", "/opt/backend", "/opt/backend"),
-        ("/srv/project", "other-host:backend", "other-host:backend"),
+        ("/srv/project", "backend", "/srv/project/backend", "backend"),
+        (None, "backend", "/etc/rcm/backend", "backend"),
+        ("/srv/project", "/opt/backend", "/opt/backend", "/opt/backend"),
+        (
+            "/srv/project",
+            "other-host:backend",
+            "other-host:backend",
+            "other-host:backend",
+        ),
     ],
 )
 def test_remote_sync_resolves_relative_destinations(
@@ -362,6 +368,7 @@ def test_remote_sync_resolves_relative_destinations(
     cwd: str | None,
     destination: str,
     expected: str,
+    workspace_destination: str,
 ) -> None:
     remote_config = RemoteConfigSpec(path="/etc/rcm/commands.yaml")
     target = ProxyTargetSpec(
@@ -384,6 +391,7 @@ def test_remote_sync_resolves_relative_destinations(
 
     assert resolved is not None
     assert resolved.mappings[0].destination == expected
+    assert resolved.mappings[0].workspace_destination == workspace_destination
     assert "implicit full-directory sync" not in caplog.text
 
 

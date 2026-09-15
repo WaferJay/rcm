@@ -129,6 +129,23 @@ def test_scoped_sync_destination_is_relative_to_workspace_base(tmp_path: Path) -
     assert command[-1] == "compile-machine:/srv/rcm/workspaces/scope-client/src/"
 
 
+def test_scoped_remote_mapping_uses_relative_destination(tmp_path: Path) -> None:
+    mapping = SyncMappingSpec(
+        source=str(tmp_path),
+        destination="/srv/project/backend",
+        workspace_destination="backend",
+    )
+    target = ProxyTargetSpec(
+        name="compile",
+        transport="ssh",
+        ssh=SSHSpec(host="compile-machine", command=["rcm", "--stdio"]),
+        sync=_sync(mapping),
+    )
+    workspace = Workspace("scope-client", Path("/srv/rcm/workspaces"))
+    command = SyncRunner(target)._command(mapping, tmp_path, workspace)
+    assert command[-1] == "compile-machine:/srv/rcm/workspaces/scope-client/backend/"
+
+
 @pytest.mark.parametrize("destination", ["/srv/project", "../escape", "host:/srv/project"])
 def test_scoped_sync_rejects_non_workspace_destination(tmp_path: Path, destination: str) -> None:
     mapping = SyncMappingSpec(source=str(tmp_path), destination=destination)

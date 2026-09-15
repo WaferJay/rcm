@@ -86,7 +86,7 @@ def parse_sync_destination(raw: Any, context: str) -> str | None:
     parts = [] if trimmed == "/" else trimmed.split("/")
     if trimmed.startswith("/") and trimmed != "/":
         parts = parts[1:]
-    if any(part in {"", ".", ".."} for part in parts):
+    if destination != "." and any(part in {"", ".", ".."} for part in parts):
         raise ConfigError(
             f"{context}.destination must not contain empty, `.` or `..` path parts"
         )
