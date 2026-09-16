@@ -13,6 +13,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -35,6 +36,14 @@ class HttpSyncError(RuntimeError):
     def __init__(self, message: str, status_code: int = 400) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class _DestinationContext:
+    """Resolved write and containment roots for one synchronization mapping."""
+
+    root: Path
+    allowed_root: Path
 
 
 def _sha256(path: Path) -> str:
@@ -117,7 +126,7 @@ class HttpSyncService:
         ):
             raise HttpSyncError("unauthorized", 401)
 
-    def _destination_root(self, payload: dict[str, Any]) -> Path:
+    def _destination_context(self, payload: dict[str, Any]) -> _DestinationContext:
         destination = _relative_path(
             payload.get("destination"), "destination", allow_dot=True
         )
@@ -144,7 +153,7 @@ class HttpSyncService:
             raise HttpSyncError("destination escapes its allowed synchronization root")
         if self._is_protected(root):
             raise HttpSyncError("destination is protected from synchronization")
-        return root
+        return _DestinationContext(root=root, allowed_root=allowed)
 
     def _is_protected(self, path: Path) -> bool:
         resolved = path.resolve(strict=False)
@@ -165,7 +174,32 @@ class HttpSyncService:
         elif path.exists():
             shutil.rmtree(path)
 
-    def _entries(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    @staticmethod
+    def _validate_symlink_target(
+        name: str, target: str, destination: _DestinationContext
+    ) -> None:
+        """Reject relative link targets that climb above the workspace root."""
+        target_path = PurePosixPath(target)
+        if target_path.is_absolute():
+            raise HttpSyncError(
+                f"symlink {name!r} escapes the allowed synchronization root"
+            )
+        mapping_depth = len(destination.root.relative_to(destination.allowed_root).parts)
+        parent_depth = len(PurePosixPath(name).parent.parts)
+        depth = mapping_depth + parent_depth
+        for part in target_path.parts:
+            if part == "..":
+                depth -= 1
+            elif part not in {"", "."}:
+                depth += 1
+            if depth < 0:
+                raise HttpSyncError(
+                    f"symlink {name!r} escapes the allowed synchronization root"
+                )
+
+    def _entries(
+        self, payload: dict[str, Any], destination: _DestinationContext
+    ) -> list[dict[str, Any]]:
         if payload.get("schema") != SYNC_MANIFEST_SCHEMA:
             raise HttpSyncError("unsupported sync manifest schema")
         if not isinstance(payload.get("delete"), bool):
@@ -212,17 +246,7 @@ class HttpSyncService:
                 target = raw.get("target")
                 if not isinstance(target, str) or not target or "\\" in target:
                     raise HttpSyncError(f"entries[{index}].target is invalid")
-                resolved = PurePosixPath(name).parent.joinpath(target)
-                depth = 0
-                for part in resolved.parts:
-                    if part == "..":
-                        depth -= 1
-                    elif part not in {"", "."}:
-                        depth += 1
-                    if depth < 0:
-                        raise HttpSyncError(f"symlink {name!r} escapes the destination")
-                if PurePosixPath(target).is_absolute():
-                    raise HttpSyncError(f"symlink {name!r} escapes the destination")
+                self._validate_symlink_target(name, target, destination)
                 entry["target"] = target
             entries.append(entry)
         kinds = {entry["path"]: entry["kind"] for entry in entries}
@@ -247,8 +271,9 @@ class HttpSyncService:
         return target
 
     def plan(self, payload: dict[str, Any]) -> dict[str, Any]:
-        root = self._destination_root(payload)
-        entries = self._entries(payload)
+        destination = self._destination_context(payload)
+        root = destination.root
+        entries = self._entries(payload, destination)
         needed: list[str] = []
         for entry in entries:
             if entry["kind"] != "file":
@@ -264,8 +289,9 @@ class HttpSyncService:
         return {"schema": SYNC_MANIFEST_SCHEMA, "needed": needed}
 
     def apply(self, payload: dict[str, Any], uploads: dict[str, bytes]) -> None:
-        root = self._destination_root(payload)
-        entries = self._entries(payload)
+        destination = self._destination_context(payload)
+        root = destination.root
+        entries = self._entries(payload, destination)
         root.mkdir(parents=True, exist_ok=True)
         expected_files = {
             entry["path"]: entry for entry in entries if entry["kind"] == "file"

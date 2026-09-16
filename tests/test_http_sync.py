@@ -159,6 +159,47 @@ def test_http_sync_rejects_unsafe_paths_and_symlinks(tmp_path: Path) -> None:
                 ]
             )
         )
+    with pytest.raises(HttpSyncError, match="allowed synchronization root"):
+        service.plan(
+            _payload(
+                destination="a",
+                entries=[
+                    {
+                        "path": "link",
+                        "kind": "symlink",
+                        "mode": 0o777,
+                        "target": "../../outside",
+                    }
+                ],
+            )
+        )
+    with pytest.raises(HttpSyncError, match="allowed synchronization root"):
+        service.plan(
+            _payload(
+                destination="a",
+                entries=[
+                    {
+                        "path": "link",
+                        "kind": "symlink",
+                        "mode": 0o777,
+                        "target": "/outside",
+                    }
+                ],
+            )
+        )
+    assert service.plan(
+        _payload(
+            destination="a",
+            entries=[
+                {
+                    "path": "root",
+                    "kind": "symlink",
+                    "mode": 0o777,
+                    "target": "..",
+                }
+            ],
+        )
+    ) == {"schema": SYNC_MANIFEST_SCHEMA, "needed": []}
 
     archive_bytes = io.BytesIO()
     with tarfile.open(fileobj=archive_bytes, mode="w:gz") as archive:
@@ -167,6 +208,88 @@ def test_http_sync_rejects_unsafe_paths_and_symlinks(tmp_path: Path) -> None:
         archive.addfile(info, io.BytesIO(b"x"))
     with pytest.raises(HttpSyncError, match="safe relative"):
         service._read_archive(archive_bytes.getvalue())
+
+
+@pytest.mark.asyncio
+async def test_http_sync_preserves_symlink_across_mapping_destinations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source_a = source / "a"
+    source_c = source / "c"
+    source_a.mkdir(parents=True)
+    (source_c / "d").mkdir(parents=True)
+    (source_c / "d" / "value.txt").write_text("shared\n", encoding="utf-8")
+    (source_a / "b").symlink_to("../c/d", target_is_directory=True)
+
+    remote = tmp_path / "remote"
+    runs = tmp_path / "runs"
+    remote.mkdir()
+    service = HttpSyncService(
+        _config(remote), Store(runs, runs.as_uri(), local_urls=True), None
+    )
+    planned_destinations: list[str] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sync/v1/plan":
+            payload = json.loads(request.content)
+            planned_destinations.append(payload["destination"])
+            if payload["destination"] == "a":
+                assert not (remote / "c").exists()
+            return httpx.Response(200, json=service.plan(payload))
+        payload, uploads = service._read_archive(request.content)
+        service.apply(payload, uploads)
+        return httpx.Response(200, json={"ok": True})
+
+    original_client = httpx.AsyncClient
+
+    def mock_client(**kwargs):
+        return original_client(
+            headers=kwargs.get("headers"),
+            timeout=kwargs.get("timeout"),
+            transport=httpx.MockTransport(handle),
+        )
+
+    monkeypatch.setattr("rcm.sync.httpx.AsyncClient", mock_client)
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="http",
+        endpoint="https://remote.example/mcp",
+        sync=SyncSpec(
+            mappings=[
+                SyncMappingSpec(source=str(source_a), destination="a", delete=True),
+                SyncMappingSpec(source=str(source_c), destination="c", delete=True),
+            ]
+        ),
+    )
+
+    await SyncRunner(target).sync()
+
+    link = remote / "a" / "b"
+    assert planned_destinations == ["a", "c"]
+    assert link.is_symlink()
+    assert link.readlink() == Path("../c/d")
+    assert link.resolve() == (remote / "c" / "d").resolve()
+    assert (link / "value.txt").read_text(encoding="utf-8") == "shared\n"
+
+    service.apply(
+        _payload(
+            destination="a",
+            delete=True,
+            entries=[
+                {
+                    "path": "b",
+                    "kind": "symlink",
+                    "mode": 0o777,
+                    "target": "../c/d",
+                }
+            ],
+        ),
+        {},
+    )
+    assert (remote / "c" / "d" / "value.txt").read_text(encoding="utf-8") == (
+        "shared\n"
+    )
 
 
 def test_http_sync_cannot_replace_parent_of_protected_runs(tmp_path: Path) -> None:
@@ -237,6 +360,36 @@ def test_http_sync_accepts_only_configured_workspace_roots(tmp_path: Path) -> No
     )
     service.apply(payload, {})
     assert (workspace_root / "scope-client" / "src").is_dir()
+
+    cross_mapping = _payload(
+        destination="a",
+        scope_id="scope-client",
+        workspace_base=str(workspace_root),
+        entries=[
+            {
+                "path": "b",
+                "kind": "symlink",
+                "mode": 0o777,
+                "target": "../c/d",
+            }
+        ],
+    )
+    service.apply(cross_mapping, {})
+    assert (workspace_root / "scope-client" / "a" / "b").readlink() == Path(
+        "../c/d"
+    )
+
+    cross_scope = dict(cross_mapping)
+    cross_scope["entries"] = [
+        {
+            "path": "b",
+            "kind": "symlink",
+            "mode": 0o777,
+            "target": "../../scope-other/d",
+        }
+    ]
+    with pytest.raises(HttpSyncError, match="allowed synchronization root"):
+        service.plan(cross_scope)
 
     payload["workspace_base"] = str(tmp_path / "other")
     with pytest.raises(HttpSyncError, match="not an allowed"):

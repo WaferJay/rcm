@@ -367,9 +367,13 @@ HTTP sync destinations must be relative POSIX paths. They are resolved below
 the remote server's `defaults.cwd` (or its process working directory when that
 setting is omitted), so the HTTP API cannot write arbitrary absolute paths.
 RCM exchanges SHA-256 manifests and uploads only new or changed files. It
-preserves directories, safe relative symbolic links, and permission bits;
-`excludes`, mapping order, and `delete` retain their SSH sync meaning. The
-remote active config and runs directory are protected from writes and deletion.
+preserves directories, safe relative symbolic links, and permission bits. A
+relative symbolic link may cross mapping destinations when its target remains
+below the same remote synchronization root, including when a later mapping
+creates that target; absolute links and links that escape the synchronization
+root are rejected. `excludes`, mapping order, and `delete` retain their SSH sync
+meaning. The remote active config and runs directory are protected from writes
+and deletion.
 
 When the discovered remote command configures `isolate`, every sync
 `destination` must instead be a relative POSIX path (use `.` for the workspace
