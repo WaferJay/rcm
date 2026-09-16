@@ -12,9 +12,11 @@ from typing import Any, Mapping
 RCM_RESULT_SCHEMA = "rcm.run-result/v2"
 RCM_CAPABILITY = "rcm.artifacts"
 RCM_WORKSPACE_CAPABILITY = "rcm.workspace"
+RCM_SYNC_CAPABILITY = "rcm.sync"
 RCM_PROTOCOL_VERSION = 2
 RCM_WORKSPACE_PROTOCOL_VERSION = 1
 RCM_WORKSPACE_SESSION_PROTOCOL_VERSION = 2
+RCM_SYNC_PROTOCOL_VERSION = 1
 RCM_SESSION_SCOPE_RESOURCE_URI = "rcm://workspace/session"
 RCM_SESSION_SCOPE_SCHEMA = "rcm.workspace-session/v1"
 RCM_CALL_META: dict[str, Any] = {
@@ -82,6 +84,11 @@ RCM_EXPERIMENTAL_CAPABILITIES: dict[str, dict[str, Any]] = {
             RCM_WORKSPACE_SESSION_PROTOCOL_VERSION,
         ],
         "sessionScopeResource": RCM_SESSION_SCOPE_RESOURCE_URI,
+    },
+    RCM_SYNC_CAPABILITY: {
+        "versions": [RCM_SYNC_PROTOCOL_VERSION],
+        "planEndpoint": "/sync/v1/plan",
+        "applyEndpoint": "/sync/v1/apply",
     },
 }
 

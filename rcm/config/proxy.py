@@ -211,6 +211,27 @@ def _validate_explicit_sync(target_name: str, sync: SyncSpec | None) -> None:
         )
 
 
+def _validate_http_sync_destinations(
+    target_name: str, sync: SyncSpec | None
+) -> None:
+    if sync is None or not sync.enabled:
+        return
+    for index, mapping in enumerate(sync.mappings):
+        destination = mapping.destination
+        if destination is None:
+            continue
+        first = destination.split("/", 1)[0]
+        if destination.startswith("/") or ":" in first:
+            context = (
+                f"proxy.{target_name}.sync.mappings[{index}].destination"
+                if len(sync.mappings) > 1
+                else f"proxy.{target_name}.sync.destination"
+            )
+            raise ConfigError(
+                f"{context} must be relative for HTTP synchronization"
+            )
+
+
 @dataclass(frozen=True)
 class _StdioTarget:
     name: str
@@ -383,6 +404,7 @@ def _build_http_target(
         raise ConfigError(f"proxy.{name}.cwd is only valid for stdio transport")
     sync = _parse_sync(raw.get("sync"), name)
     _validate_explicit_sync(name, sync)
+    _validate_http_sync_destinations(name, sync)
     return _HttpTarget(
         name,
         transport,

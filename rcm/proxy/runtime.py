@@ -18,6 +18,8 @@ from ..artifacts import (
     RCM_PROTOCOL_VERSION,
     RCM_SESSION_SCOPE_RESOURCE_URI,
     RCM_SESSION_SCOPE_SCHEMA,
+    RCM_SYNC_CAPABILITY,
+    RCM_SYNC_PROTOCOL_VERSION,
     RCM_WORKSPACE_CAPABILITY,
     RCM_WORKSPACE_PROTOCOL_VERSION,
     RCM_WORKSPACE_SESSION_PROTOCOL_VERSION,
@@ -43,6 +45,18 @@ def _supports_rcm_v2(client: Client) -> bool:
         return False
     versions = capability.get("versions")
     return isinstance(versions, list) and RCM_PROTOCOL_VERSION in versions
+
+
+def _supports_http_sync(client: Client) -> bool:
+    initialized = client.initialize_result
+    if initialized is None:
+        return False
+    experimental = initialized.capabilities.experimental or {}
+    capability = experimental.get(RCM_SYNC_CAPABILITY)
+    if not isinstance(capability, dict):
+        return False
+    versions = capability.get("versions")
+    return isinstance(versions, list) and RCM_SYNC_PROTOCOL_VERSION in versions
 
 
 def _workspace_capability(client: Client) -> dict[str, Any] | None:
@@ -251,6 +265,15 @@ class ProxyRuntime:
                     raise ProxyError(
                         f"proxy target {target.name!r} failed to connect: {exc}"
                     ) from exc
+                if (
+                    sync_runner is not None
+                    and sync_runner.uses_http
+                    and not _supports_http_sync(client)
+                ):
+                    raise ProxyError(
+                        f"proxy target {target.name!r} configures HTTP sync but "
+                        "the target does not support RCM HTTP sync v1"
+                    )
                 rcm_peer = _supports_rcm_v2(client)
                 workspace_peer = _supports_workspace_scopes(client)
                 if configured_target.remote_config is not None and not rcm_peer:

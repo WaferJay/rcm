@@ -144,6 +144,24 @@ def test_load_commands_and_proxy_together(tmp_path: Path) -> None:
     assert [target.name for target in cfg.proxy.targets] == ["remote"]
 
 
+def test_http_sync_requires_relative_destination(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="relative for HTTP synchronization"):
+        load_config(
+            write(
+                tmp_path,
+                """
+                proxy:
+                  remote:
+                    transport: http
+                    endpoint: https://example.com/mcp
+                    sync:
+                      source: ./source
+                      destination: /srv/project
+                """,
+            )
+        )
+
+
 def test_mode_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="mode.*no longer supported"):
         load_config(

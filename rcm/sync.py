@@ -3,13 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
+import json
 import os
 import posixpath
 import shlex
 import shutil
+import stat
+import tarfile
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit, urlunsplit
+
+import httpx
 
 from .config import ProxyTargetSpec, SyncMappingSpec, SyncSpec
+from .http_sync import (
+    SYNC_FILE_PREFIX,
+    SYNC_MANIFEST_MEMBER,
+    SYNC_MANIFEST_SCHEMA,
+    matches_sync_exclude,
+)
 from .workspace import Workspace
 
 
@@ -31,7 +45,7 @@ def _trailing_slash(value: str) -> str:
 
 
 class SyncRunner:
-    """Run locked, ordered, one-way rsync operations for a proxy target."""
+    """Run locked, ordered one-way sync operations for a proxy target."""
 
     def __init__(
         self,
@@ -57,6 +71,10 @@ class SyncRunner:
         )
         self._lock = asyncio.Lock()
         self._validate_destinations()
+
+    @property
+    def uses_http(self) -> bool:
+        return self.target.transport in {"http", "sse"} and self.target.ssh is None
 
     def _source_path(self, mapping: SyncMappingSpec, index: int) -> Path:
         if mapping.source is None:
@@ -100,6 +118,32 @@ class SyncRunner:
             if ":" not in destination.split("/", 1)[0]:
                 return f"{self.target.ssh.host}:{destination}"
         return destination
+
+    def _http_destination(
+        self, mapping: SyncMappingSpec, workspace: Workspace | None
+    ) -> str:
+        if mapping.destination is None:
+            raise SyncError(
+                f"sync destination is not configured for target {self.target.name!r}"
+            )
+        destination = (
+            mapping.workspace_destination
+            if workspace is not None and mapping.workspace_destination is not None
+            else mapping.destination
+        )
+        first = destination.split("/", 1)[0]
+        normalized = posixpath.normpath(destination)
+        if (
+            destination.startswith("/")
+            or ":" in first
+            or "\\" in destination
+            or normalized == ".."
+            or normalized.startswith("../")
+        ):
+            raise SyncError(
+                "HTTP sync.destination must be a relative POSIX path"
+            )
+        return normalized
 
     @staticmethod
     def _workspace_destination(destination: str, workspace: Workspace) -> str:
@@ -229,6 +273,8 @@ class SyncRunner:
                     f"sync mapping {index} for target {self.target.name!r} "
                     "requires source and destination"
                 )
+            if self.uses_http:
+                self._http_destination(mapping, None)
 
         for left_index, left in enumerate(mappings):
             left_host, left_absolute, left_parts = self._destination_identity(left)
@@ -249,16 +295,237 @@ class SyncRunner:
                         "while delete is enabled"
                     )
 
+    @staticmethod
+    def _matches_exclude(relative: str, pattern: str, *, directory: bool) -> bool:
+        return matches_sync_exclude(relative, pattern, directory=directory)
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _http_manifest(
+        self,
+        mapping: SyncMappingSpec,
+        source: Path,
+        workspace: Workspace | None,
+    ) -> tuple[dict[str, object], dict[str, Path]]:
+        patterns = self._protected_patterns(mapping, source)
+        entries: list[dict[str, object]] = []
+        files: dict[str, Path] = {}
+
+        def excluded(relative: str, *, directory: bool) -> bool:
+            return any(
+                self._matches_exclude(relative, pattern, directory=directory)
+                for pattern in patterns
+            )
+
+        for current, directory_names, file_names in os.walk(
+            source, topdown=True, followlinks=False
+        ):
+            current_path = Path(current)
+            kept_directories: list[str] = []
+            for name in sorted(directory_names):
+                path = current_path / name
+                relative = path.relative_to(source).as_posix()
+                if excluded(relative, directory=True):
+                    continue
+                metadata = path.lstat()
+                if stat.S_ISLNK(metadata.st_mode):
+                    entries.append(
+                        {
+                            "path": relative,
+                            "kind": "symlink",
+                            "mode": stat.S_IMODE(metadata.st_mode),
+                            "target": os.readlink(path),
+                        }
+                    )
+                else:
+                    entries.append(
+                        {
+                            "path": relative,
+                            "kind": "directory",
+                            "mode": stat.S_IMODE(metadata.st_mode),
+                        }
+                    )
+                    kept_directories.append(name)
+            directory_names[:] = kept_directories
+            for name in sorted(file_names):
+                path = current_path / name
+                relative = path.relative_to(source).as_posix()
+                if excluded(relative, directory=False):
+                    continue
+                metadata = path.lstat()
+                if stat.S_ISLNK(metadata.st_mode):
+                    entries.append(
+                        {
+                            "path": relative,
+                            "kind": "symlink",
+                            "mode": stat.S_IMODE(metadata.st_mode),
+                            "target": os.readlink(path),
+                        }
+                    )
+                elif stat.S_ISREG(metadata.st_mode):
+                    entries.append(
+                        {
+                            "path": relative,
+                            "kind": "file",
+                            "mode": stat.S_IMODE(metadata.st_mode),
+                            "size": metadata.st_size,
+                            "sha256": self._file_sha256(path),
+                        }
+                    )
+                    files[relative] = path
+
+        payload: dict[str, object] = {
+            "schema": SYNC_MANIFEST_SCHEMA,
+            "destination": self._http_destination(mapping, workspace),
+            "delete": mapping.delete,
+            "excludes": patterns,
+            "entries": entries,
+        }
+        if workspace is not None:
+            payload["scope_id"] = workspace.scope_id
+            payload["workspace_base"] = str(workspace.base_dir)
+        return payload, files
+
+    @staticmethod
+    def _http_archive(
+        payload: dict[str, object],
+        files: dict[str, Path],
+        needed: list[str],
+    ) -> bytes:
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz", compresslevel=6) as archive:
+            manifest = json.dumps(
+                payload, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            info = tarfile.TarInfo(SYNC_MANIFEST_MEMBER)
+            info.size = len(manifest)
+            info.mode = 0o600
+            archive.addfile(info, io.BytesIO(manifest))
+            for relative in needed:
+                path = files.get(relative)
+                if path is None:
+                    raise SyncError(
+                        f"HTTP sync server requested unknown file {relative!r}"
+                    )
+                info = tarfile.TarInfo(f"{SYNC_FILE_PREFIX}{relative}")
+                info.size = path.stat().st_size
+                info.mode = 0o600
+                with path.open("rb") as stream:
+                    archive.addfile(info, stream)
+        return output.getvalue()
+
+    def _http_endpoint(self, route: str) -> str:
+        if self.target.endpoint is None:
+            raise SyncError(
+                f"HTTP sync target {self.target.name!r} has no endpoint"
+            )
+        parsed = urlsplit(self.target.endpoint)
+        path = parsed.path.rstrip("/")
+        for suffix in ("/mcp", "/sse"):
+            if path.endswith(suffix):
+                path = path[: -len(suffix)]
+                break
+        return urlunsplit((parsed.scheme, parsed.netloc, f"{path}{route}", "", ""))
+
+    def _http_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for name, spec in self.target.headers.items():
+            if spec.value is not None:
+                headers[name] = spec.value
+            elif spec.env is not None:
+                value = os.environ.get(spec.env)
+                if not value:
+                    raise SyncError(
+                        f"environment variable {spec.env!r} for target "
+                        f"{self.target.name!r} header {name!r} is missing or empty"
+                    )
+                headers[name] = value
+        return headers
+
+    async def _http_sync_mapping(
+        self,
+        mapping: SyncMappingSpec,
+        source: Path,
+        workspace: Workspace | None,
+    ) -> None:
+        try:
+            payload, files = await asyncio.to_thread(
+                self._http_manifest, mapping, source, workspace
+            )
+            async with httpx.AsyncClient(
+                headers=self._http_headers(), timeout=httpx.Timeout(60.0)
+            ) as client:
+                response = await client.post(
+                    self._http_endpoint("/sync/v1/plan"), json=payload
+                )
+                response.raise_for_status()
+                try:
+                    result = response.json()
+                except ValueError as exc:
+                    raise SyncError(
+                        "HTTP sync server returned an invalid JSON plan"
+                    ) from exc
+                needed = result.get("needed") if isinstance(result, dict) else None
+                if (
+                    not isinstance(needed, list)
+                    or any(not isinstance(value, str) for value in needed)
+                ):
+                    raise SyncError("HTTP sync server returned an invalid plan")
+                archive = await asyncio.to_thread(
+                    self._http_archive, payload, files, needed
+                )
+                response = await client.post(
+                    self._http_endpoint("/sync/v1/apply"),
+                    content=archive,
+                    headers={"Content-Type": "application/gzip"},
+                )
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            try:
+                error = exc.response.json().get("error")
+            except (ValueError, AttributeError):
+                error = None
+            detail = error if isinstance(error, str) else exc.response.text.strip()
+            suffix = f": {detail}" if detail else ""
+            raise SyncError(
+                f"HTTP sync for target {self.target.name!r} failed with status "
+                f"{exc.response.status_code}{suffix}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise SyncError(
+                f"HTTP sync for target {self.target.name!r} failed: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise SyncError(
+                f"HTTP sync for target {self.target.name!r} could not read its "
+                f"source files: {exc}"
+            ) from exc
+
     async def sync(self, workspace: Workspace | None = None) -> None:
         """Synchronize all mappings in order, serializing calls for this target."""
         async with self._lock:
-            if shutil.which("rsync") is None:
+            if not self.uses_http and shutil.which("rsync") is None:
                 raise SyncError("rsync executable not found")
             resolved = [
                 (index, mapping, self._source_path(mapping, index))
                 for index, mapping in enumerate(self.spec.mappings, start=1)
             ]
             for index, mapping, source in resolved:
+                if self.uses_http:
+                    try:
+                        await self._http_sync_mapping(mapping, source, workspace)
+                    except SyncError as exc:
+                        raise SyncError(
+                            f"sync mapping {index} for target {self.target.name!r} "
+                            f"failed: {exc}"
+                        ) from exc
+                    continue
                 destination = self._destination(mapping, workspace)
                 command = self._command(mapping, source, workspace)
                 try:

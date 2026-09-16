@@ -303,7 +303,7 @@ async def test_proxy_runtime_bridges_streamable_http(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_http_session_isolated_target_uses_its_remote_session_workspace(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path,
 ) -> None:
     import sys
 
@@ -317,6 +317,7 @@ async def test_http_session_isolated_target_uses_its_remote_session_workspace(
     remote_work.mkdir()
     source = tmp_path / "source"
     source.mkdir()
+    (source / "marker.txt").write_text("synced over HTTP\n", encoding="utf-8")
     remote = build_server(
         Config(
             server=ServerSpec(public_base_url=base_url),
@@ -356,12 +357,6 @@ async def test_http_session_isolated_target_uses_its_remote_session_workspace(
                 raise RuntimeError("remote HTTP RCM failed to start")
             await asyncio.sleep(0.05)
 
-    synced_workspaces = []
-
-    async def capture_sync(_, workspace) -> None:
-        synced_workspaces.append(workspace)
-
-    monkeypatch.setattr("rcm.sync.SyncRunner.sync", capture_sync)
     cfg = Config(
         server=ServerSpec(),
         auth=AuthSpec(api_key=None),
@@ -409,14 +404,9 @@ async def test_http_session_isolated_target_uses_its_remote_session_workspace(
         )
         assert first_stdout.read_text().strip() == str(expected)
         assert second_stdout.read_text().strip() == str(expected)
-        assert [workspace.scope_id for workspace in synced_workspaces] == [
-            scope_id,
-            scope_id,
-        ]
-        assert [workspace.base_dir for workspace in synced_workspaces] == [
-            remote_work,
-            remote_work,
-        ]
+        assert (expected / "marker.txt").read_text(encoding="utf-8") == (
+            "synced over HTTP\n"
+        )
     finally:
         if runtime is not None:
             await runtime.close()

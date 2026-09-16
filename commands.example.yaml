@@ -55,6 +55,12 @@ server:
 #   remote_tools:
 #     transport: http
 #     endpoint: https://remote.example.com/mcp
+#     # Pure HTTP sync; destination is relative to the remote defaults.cwd.
+#     sync:
+#       source: /home/me/project
+#       destination: project
+#       excludes: [".git/**", "build/**", "**/*.pyc"]
+#       delete: false
 #     # For an RCM v2 target only; omit to download into this RCM's run store.
 #     artifacts: passthrough
 #     headers:

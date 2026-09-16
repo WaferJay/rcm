@@ -28,6 +28,7 @@ from .artifacts import (
 )
 from .auth import ApiKeyAuth
 from .config import CommandSpec, Config, ParamSpec, TLSConfig, load_config
+from .http_sync import register_http_sync_routes
 from .runner import run_command
 from .proxy import ProxyError, ProxyRuntime
 from .store import RUN_ID_RE, Store
@@ -288,6 +289,7 @@ def build_server(cfg: Config, store: Store, api_key: str | None) -> FastMCP:
     _register_command_tools(mcp, cfg, store, scope_resolver)
     _register_workspace_resources(mcp, scope_resolver)
     _register_download_routes(mcp, store)
+    register_http_sync_routes(mcp, cfg, store, api_key)
     return mcp
 
 
@@ -300,6 +302,7 @@ async def build_proxy_server(
         _register_command_tools(runtime.server, cfg, store, runtime.scope_resolver)
         _register_workspace_resources(runtime.server, runtime.scope_resolver)
         _register_download_routes(runtime.server, store)
+        register_http_sync_routes(runtime.server, cfg, store, api_key)
     except Exception:
         await runtime.close()
         raise

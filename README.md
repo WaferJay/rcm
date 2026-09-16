@@ -287,6 +287,13 @@ proxy:
   reports:
     transport: http
     endpoint: https://reports.example.com/mcp
+    # HTTP targets synchronize through RCM itself; SSH and rsync are not needed.
+    # The destination is relative to the remote defaults.cwd.
+    sync:
+      source: /home/me/project
+      destination: project
+      excludes: [.git/**, build/**, '**/*.pyc']
+      delete: false
     # Optional for an RCM v2 target. Default: localize.
     artifacts: passthrough
     headers:
@@ -340,10 +347,14 @@ A configuration must contain at least one of `commands` or `proxy`. A proxy-only
 configuration may omit `commands`; a commands-only configuration may omit
 `proxy`.
 
-For an explicitly configured target, adding `sync` runs one-way `rsync`
-immediately before every `tools/call`. A remote-config target keeps the legacy
-behavior of synchronizing the local working directory even when `sync` is
-omitted; rcm logs a warning for this implicit full-directory sync. Use
+For an explicitly configured target, adding `sync` performs a one-way
+synchronization immediately before every `tools/call`. SSH targets use `rsync`.
+HTTP/SSE targets use the authenticated RCM HTTP sync protocol and therefore do
+not require SSH or a remote `rsync`; the target must be an RCM server that
+advertises HTTP sync v1. The configured target headers, including
+`Authorization`, are reused for sync requests. A remote-config target keeps the
+legacy behavior of synchronizing the local working directory even when `sync`
+is omitted; rcm logs a warning for this implicit full-directory sync. Use
 `sync: {enabled: false}` to disable it.
 
 `sync.mappings` accepts one or more independent `source` and `destination`
@@ -351,6 +362,14 @@ pairs. They run in order under one target-level lock, and each mapping has its
 own `excludes` and `delete` options. A failed mapping stops the remaining
 mappings and blocks the remote call. The legacy single-mapping fields directly
 under `sync` remain supported, but cannot be mixed with `mappings`.
+
+HTTP sync destinations must be relative POSIX paths. They are resolved below
+the remote server's `defaults.cwd` (or its process working directory when that
+setting is omitted), so the HTTP API cannot write arbitrary absolute paths.
+RCM exchanges SHA-256 manifests and uploads only new or changed files. It
+preserves directories, safe relative symbolic links, and permission bits;
+`excludes`, mapping order, and `delete` retain their SSH sync meaning. The
+remote active config and runs directory are protected from writes and deletion.
 
 When the discovered remote command configures `isolate`, every sync
 `destination` must instead be a relative POSIX path (use `.` for the workspace

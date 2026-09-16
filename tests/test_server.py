@@ -28,12 +28,17 @@ from rcm.config import (
     Config,
     DefaultsSpec,
     IsolationSpec,
+    HeaderSpec,
     ParamSpec,
+    ProxyTargetSpec,
     ServerSpec,
+    SyncMappingSpec,
+    SyncSpec,
 )
 from rcm.proxy import ProxyError
 from rcm.server import _build_tool_fn, _run_proxy_service, build_server
 from rcm.store import Store
+from rcm.sync import SyncRunner
 
 
 def make_store(tmp_path: Path) -> Store:
@@ -186,7 +191,12 @@ async def running_server(tmp_path: Path, free_port: int):
             await asyncio.sleep(0.05)
 
     try:
-        yield {"port": free_port, "store": store, "url": f"http://127.0.0.1:{free_port}"}
+        yield {
+            "port": free_port,
+            "store": store,
+            "url": f"http://127.0.0.1:{free_port}",
+            "workspace_root": workspace_root,
+        }
     finally:
         task.cancel()
         try:
@@ -228,6 +238,12 @@ async def test_server_advertises_rcm_v2_without_internal_tools(running_server) -
     workspace = initialized.capabilities.experimental["rcm.workspace"]
     assert workspace["versions"] == [1, 2]
     assert workspace["sessionScopeResource"] == RCM_SESSION_SCOPE_RESOURCE_URI
+    sync = initialized.capabilities.experimental["rcm.sync"]
+    assert sync == {
+        "versions": [1],
+        "planEndpoint": "/sync/v1/plan",
+        "applyEndpoint": "/sync/v1/apply",
+    }
     assert {tool.name for tool in tools} == {
         "echo_hi",
         "echo_arg",
@@ -452,3 +468,34 @@ async def test_healthz(running_server) -> None:
         resp = await h.get(f"{base}/healthz")
         assert resp.status_code == 200
         assert resp.text == "ok"
+
+
+async def test_http_sync_routes_require_auth_and_apply_changes(
+    running_server, tmp_path: Path
+) -> None:
+    import httpx
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "main.txt").write_text("through HTTP\n", encoding="utf-8")
+    target = ProxyTargetSpec(
+        name="remote",
+        transport="http",
+        endpoint=f'{running_server["url"]}/mcp',
+        headers={"Authorization": HeaderSpec(value="Bearer testkey")},
+        sync=SyncSpec(
+            mappings=[
+                SyncMappingSpec(source=str(source), destination="synced")
+            ]
+        ),
+    )
+
+    await SyncRunner(target).sync()
+
+    synchronized = running_server["workspace_root"] / "synced" / "main.txt"
+    assert synchronized.read_text(encoding="utf-8") == "through HTTP\n"
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f'{running_server["url"]}/sync/v1/plan', json={}
+        )
+    assert response.status_code == 401
